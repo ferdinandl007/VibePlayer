@@ -1,0 +1,20 @@
+# Xcode and SwiftPM build products
+DerivedData/
+build/
+.build/
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+
+# Local model assets and credentials
+YuE2Assets/
+YuE2MetalAssets/
+*.gguf
+.env
+.env.*
+
+# macOS and Python
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
