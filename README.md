@@ -1,41 +1,102 @@
 # Vibe Player
 
-A native iPhone, iPad, and macOS radio and song-idea prototype built with SwiftUI and AVFoundation. Open `VibePlayer.xcodeproj` and run the VibePlayer scheme on iOS/iPadOS 18 or later, or macOS 15 or later. Choose “My Mac” for the native macOS app.
+**An open-source AI music player and generative radio for iPhone, iPad, and Mac.** Describe a song or shape a station, then make music locally with YuE2, SwiftUI, Core ML, and Metal.
 
-Radio contains selectable stations with genres, moods, instruments, voice, and tempo adjusted directly by sliding their pills. Press Play to prepare the first song and start filling the queue. The full-screen player shows the current song’s position, queued songs, and the next render’s stage. The mini player fills as audio plays or Radio prepares a song. Settings and bookmarks are saved locally. The animated player background responds to audio level and transient changes, with Reduce Motion support.
+Vibe Player is an experimental native app for exploring what a music player feels like when you can change the music itself. Choose a mood, adjust the instruments, and let Radio prepare the next track—or start with your own idea and lyrics.
 
-Create lets you describe an idea, save it to Library, or ask the writing model to draft lyrics. YuE2 receives the sound description and lyrics as separate fields. The app counts the combined prompt with YuE2’s tokenizer and asks the writing model for a shorter version if needed. Tap the Create dock to see the active render, the playable buffer, and the prompts waiting in the session’s generation queue. You can submit another prompt from the composer while a song is rendering.
+<p align="center">
+  <img src="Screenshots/radio.png" alt="Vibe Player Radio showing a selection of music stations" width="30%" />
+  &nbsp;
+  <img src="Screenshots/player.png" alt="Vibe Player's full-screen player with adjustable sound controls" width="30%" />
+  &nbsp;
+  <img src="Screenshots/sounds.png" alt="Vibe Player sound editor for shaping a station" width="30%" />
+</p>
+<p align="center"><em>Pick a station. Shape the sound. Hear what comes next.</em></p>
 
-The iPhone and iPad player fills the available window and uses one continuous layout at every width. iPhone and iPad use system navigation, and Mac uses a standard navigation sidebar. On Mac, the player opens in the main window, and Playback menu commands and keyboard shortcuts control playback. Sound pills support dragging, clicking, and keyboard arrows. Imported songs use embedded artwork when available. On iOS and macOS 26 and later, player controls use native Liquid Glass, with a material fallback on older systems. The iOS UI test target exercises radio, sound editors, creation, library, file picker, playback, and landscape navigation.
+> **Early prototype:** Build it in Xcode and bring your own model assets. Music generation requires separately downloaded YuE2 weights; it is not ready to generate songs immediately after cloning.
 
-## Preparing music generation
+## What you can do
 
-Each radio station is converted into a `MusicGenerationRequest` by `MusicPromptBuilder`. The request snapshots the station name, style, voice choice, a random seed, a range of 2,000–4,200 YuE2 semantic frames at 25 frames per second, and eight synthesis steps. The app clamps that range to the installed model. For a vocal sound, the writing model drafts original lyrics before rendering. Instrumental and zeroed voice requests keep lyrics empty. If no voice control is selected, vocals are the default.
+- **Make your own radio.** Pick a station and adjust its genre, mood, instruments, voice, and tempo. Radio prepares songs in the background and crossfades to the next one when it is ready.
+- **Create songs from an idea.** Describe the sound, provide lyrics or ask a writing model to help, and follow generation progress in the Create view.
+- **Listen as audio becomes available.** Early playback builds a buffer while generation continues; High quality uses full acoustic context. Availability depends on your installed assets and device.
+- **Keep the songs you love.** Created songs are saved to your library. Like a Radio track to keep it; unsaved Radio renders are temporary.
+- **Feel at home on Apple devices.** A native SwiftUI interface adapts to iPhone, iPad, and Mac, with a responsive player, keyboard controls on Mac, and Reduce Motion support.
 
-Active genre, mood, and instrument controls are ordered by their intensities and mapped to subtle, moderate, or prominent cues; zero-intensity controls are omitted. These are textual hints, not precise audio-mix or tempo controls. The voice choice is included when selected and active; if no voice control is selected, vocals are used. New selections allow one voice choice at a time; for an older saved station containing both, the higher intensity wins, with alphabetical order breaking a tie. Generation is canceled when the station, its settings, or the loaded audio changes, and a late result is discarded. Once a renderer is available, a committed slider or sound-selection change schedules a new song after a short debounce; existing audio continues until the replacement is ready.
+The station controls describe the sound in a prompt. They are creative cues, not precise audio mixing or tempo controls.
 
-`YuE2GenerationBackend` connects `Packages/YuE2CoreML` to the player. Create and Radio require the indexed version 3 bundle named `YuE2MetalAssets` in the app bundle or Application Support. Metal generates the song tokens. Core ML runs prompt prefill, acoustic synthesis, and waveform decoding using the CPU and GPU. Create stops when the model emits its end token or reaches its maximum length.
+## See it on iPad
 
-The Create Metal menu offers two modes. **Early playback** renders overlapping sections and builds a buffer before starting. If the buffer runs low, playback fades out and waits for more audio, then fades back in at the same position. **High quality** finishes composing, synthesizes the song with its full acoustic context, and starts playback once the waveform decoder has built a buffer. Vocal prompts default to High quality and instrumental prompts default to Early playback where available. An explicit mode selection applies to subsequent prompts. On iOS, the Create cap is 4,200 frames (2:48 of audio). Completed Create songs save to Library automatically.
+<p align="center">
+  <img src="Screenshots/wide-player.png" alt="Vibe Player's player on an iPad-sized screen" width="68%" />
+</p>
 
-The package exporter builds an asset bundle from separately obtained YuE2 weights. The weights and compiled assets are not included in this repository; use assets compiled for the device’s platform. YuE2 weights are distributed under CC BY-NC 4.0, separately from this project's MIT license. [Package instructions](Packages/YuE2CoreML/README.md)
+These screenshots show an earlier prototype using sample audio. The current generation features require model setup described below.
 
-To run the standalone prompt checks on a Mac:
+## Get started
+
+### Requirements
+
+- Xcode with a recent Swift toolchain; the packages use Swift 6.2 or later.
+- iOS or iPadOS 18+, or macOS 15+.
+- For music generation, compatible YuE2 model assets prepared for the target device. The model weights and compiled assets are **not** included in this repository.
+
+### Build the app
+
+1. Open `VibePlayer.xcodeproj` in Xcode.
+2. Select the **VibePlayer** scheme and your iPhone, iPad, or **My Mac**.
+3. Choose your signing team if needed and run the app.
+
+You can explore the interface and its bundled sample audio without a model. To generate songs, prepare and install the assets below.
+
+### Set up local music generation
+
+The app looks for an indexed version 3 bundle named `YuE2MetalAssets` in its app resources or Application Support. It uses Metal for song tokens and Core ML for prompt prefill, acoustic synthesis, and waveform decoding. Export assets for the platform you intend to run on.
+
+1. Obtain the [audio.cpp YuE2 GGUF checkpoint](https://huggingface.co/audio-cpp/Yue2-3B-GGUF), including the required weights and sidecars.
+2. Follow the [YuE2CoreML export and Metal indexing instructions](Packages/YuE2CoreML/README.md#metal-decoder-preview).
+3. Install the resulting `YuE2MetalAssets` directory in the app bundle or its Application Support directory. Keep the complete bundle together.
+
+On Apple silicon Macs, an additional `YuE2NativeAssets` directory in Application Support enables the audio.cpp Metal runtime for Early playback and Radio. Opening Create prewarms the four-step preview. Radio queues complete eight-step renders. The directory contains `libaudiocpp.dylib`, `yue2.json`, and a `weights/` directory with the GGUF files and sidecars. See [YuE2Kit's runtime and asset instructions](Packages/YuE2Kit/README.md#runtime-and-weights).
+
+Model assets can require several gigabytes. The separately distributed YuE2 weights use **CC BY-NC 4.0**; check the [model card](https://huggingface.co/m-a-p/YuE2-3B) before using or distributing them.
+
+## How it works
+
+### Radio
+
+A station becomes a generation request containing the selected style, voice, a random seed, and a length range. For vocal tracks, the writing model can draft original lyrics; instrumental requests leave lyrics empty. Radio renders one song at a time and keeps up to two ready. Changing a station or its sound controls discards the old queue and schedules a replacement; existing audio continues until the replacement is ready. **Prepare songs** can fill the queue while playback is paused.
+
+### Create
+
+Create sends the sound description and lyrics to YuE2 as separate fields. The app checks the model's token budget and can ask the writing model to shorten a prompt. You can queue another idea while a song is rendering and cancel a render in progress. On iOS, Create is capped at 4,200 semantic frames, or 2:48 of audio.
+
+**Early playback** generates overlapping sections and starts after building a buffer. If generation falls behind, playback fades out and resumes from the same position when enough audio is ready. **High quality** synthesizes with full acoustic context and starts when the waveform decoder has built a buffer. Vocal prompts default to High quality and instrumental prompts default to Early playback where available; an explicit choice applies to subsequent prompts.
+
+### Writing and privacy
+
+Music generation runs locally using the installed model. For songwriting, you can supply your own lyrics or configure a Gemini API key in Create. The key is stored in the device Keychain; when configured, writing requests are normally sent to Gemini over HTTPS. If there is no key or the connection fails, the app uses Apple's on-device Foundation Model when available.
+
+## Project structure
+
+- [`VibePlayer/`](VibePlayer/) — SwiftUI app, player, Radio, Create, and generation integration.
+- [`Packages/YuE2CoreML/`](Packages/YuE2CoreML/) — reusable Swift package, Metal decoder, Core ML renderer, and asset exporter.
+- [`Packages/YuE2Kit/`](Packages/YuE2Kit/) — macOS audio.cpp integration and benchmark.
+- [`Tests/`](Tests/) and [`VibePlayerUITests/`](VibePlayerUITests/) — focused checks and UI tests.
+
+To run the standalone music prompt checks on a Mac:
 
 ```sh
 xcrun swiftc -parse-as-library VibePlayer/MusicGeneration.swift Tests/MusicPromptBuilderChecks.swift -o /tmp/vibe-prompt-checks
 /tmp/vibe-prompt-checks
 ```
 
-Songwriting settings in Create store the user’s Gemini API key in the device Keychain after a short connection test. When a key is configured, the app normally sends writing requests to Gemini over HTTPS. If the connection fails or there’s no key, it uses Apple’s on-device Foundation Model when available. Users can supply their own lyrics for vocal songs. Create shows render progress and allows cancellation.
+See the package READMEs for additional tests, export options, and runtime details.
 
+## Contributing
 
-## Songs and radio
-
-Radio renders one song at a time and keeps up to two ready. **Prepare songs** fills the queue while playback is paused. A ready song crossfades near the end of the current track. Committed sound changes discard the old queue and crossfade as soon as the updated song is ready. If the queue empties, the progress bar stays visible while Radio waits and playback resumes automatically. A station that requests vocals can fall back to instrumental music when its lyric request fails.
-
-Like a generated radio song to copy its audio into the persistent Songs library. Created songs are saved there automatically. Radio renders that are not saved are temporary and are removed after playback or on the next app launch. The library supports playback and explicit deletion. Song ideas and station bookmarks remain separate.
+Issues, ideas, and pull requests are welcome. If you encounter a generation problem, include the device, OS, model asset configuration, and steps to reproduce it. Please avoid sharing API keys or private audio.
 
 ## License
 
-The project is available under the [MIT License](LICENSE). Third-party models and dependencies are subject to their own licenses; in particular, the separately obtained [YuE2 weights](https://huggingface.co/m-a-p/YuE2-3B) are licensed under CC BY-NC 4.0.
+Vibe Player is available under the [MIT License](LICENSE). Third-party components have their own terms: YuE2Kit includes an audio.cpp ABI header under the [Apache License 2.0](Packages/YuE2Kit/LICENSE.audio.cpp), and the separately obtained [YuE2 weights](https://huggingface.co/m-a-p/YuE2-3B) are licensed under CC BY-NC 4.0.

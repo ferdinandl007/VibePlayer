@@ -9,6 +9,7 @@ xcuserdata/
 # Local model assets and credentials
 YuE2Assets/
 YuE2MetalAssets/
+YuE2NativeAssets/
 *.gguf
 .env
 .env.*
