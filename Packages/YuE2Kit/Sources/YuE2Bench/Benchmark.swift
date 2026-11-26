@@ -7,7 +7,7 @@ enum Benchmark {
     static func main() async throws {
         let args = Array(CommandLine.arguments.dropFirst())
         guard args.count >= 4 else {
-            print("Usage: yue2-bench LIBRARY WEIGHTS LYRICS OUTPUT [--spec FILE] [--style TEXT] [--seed N] [--play|--mute] [--full FRAMES|--preview] [--steps N]")
+            print("Usage: yue2-bench LIBRARY WEIGHTS LYRICS OUTPUT [--spec FILE] [--style TEXT] [--seed N] [--guidance-scale N] [--play|--mute] [--full FRAMES|--preview] [--steps N]")
             return
         }
         let clock = ContinuousClock()
@@ -23,14 +23,16 @@ enum Benchmark {
         let style = try argument("--style", in: args) ??
             "English, 126 BPM euphoric electro house, tight four-on-the-floor kick, clean punchy sub bass, crisp drums, bright arpeggiated synth, clear confident sung lead vocal, layered chorus harmonies, vocals enter early"
         let seed = try argument("--seed", in: args) ?? "20261122"
+        let guidance = try argument("--guidance-scale", in: args) ?? "1.01"
         guard !(preview && full != nil), let stepCount = Int(steps),
-              let frames = Int(full ?? "5000"), let seed = UInt64(seed) else {
+              let frames = Int(full ?? "5000"), let seed = UInt64(seed),
+              let guidanceScale = Float(guidance), guidanceScale.isFinite, guidanceScale >= 1 else {
             throw YuE2Error.invalidRequest
         }
         let engine = try await YuE2Engine.load(library: library, weights: weights, modelSpec: spec,
                                                mode: preview ? .streamingPreview : .fullSong)
         report("load", duration: loadStart.duration(to: clock.now))
-        let prompt = YuE2Prompt(lyrics: lyrics, style: style, seed: seed)
+        let prompt = YuE2Prompt(lyrics: lyrics, style: style, seed: seed, guidanceScale: guidanceScale)
         let sink = try AudioSink(output: output, playback: args.contains("--play") || args.contains("--mute"),
                                  muted: args.contains("--mute"))
         if preview {

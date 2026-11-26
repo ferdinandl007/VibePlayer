@@ -1,11 +1,11 @@
 diff --git a/include/audiocpp.h b/include/audiocpp.h
-index ea5a1c4..216ad8a 100644
+index ea5a1c4..bbe5670 100644
 --- a/include/audiocpp.h
 +++ b/include/audiocpp.h
-@@ -498,6 +498,16 @@ AUDIOCPP_API audiocpp_status audiocpp_result_artifact_meta(const audiocpp_result
+@@ -498,6 +498,27 @@ AUDIOCPP_API audiocpp_status audiocpp_result_artifact_meta(const audiocpp_result
                                                             const char ** out_key,
                                                             const char ** out_value);
- 
+
 +/* Delivers finalized YuE2 VAE tiles after full-song acoustic synthesis.
 + * Invoked synchronously on the calling thread. PCM lives for the call only.
 + * Return nonzero to stop decoding. Offsets are stereo frame indices. */
@@ -16,37 +16,50 @@ index ea5a1c4..216ad8a 100644
 +    audiocpp_session * session, const audiocpp_request * request, audiocpp_yue2_pcm_callback callback,
 +    void * context, audiocpp_result ** out_result);
 +
++/* Reports completed synthesis steps, then the start of waveform decoding.
++ * Callbacks run synchronously. Return nonzero from either callback to cancel. */
++typedef enum audiocpp_yue2_progress_stage {
++    AUDIOCPP_YUE2_SYNTHESIS = 0,
++    AUDIOCPP_YUE2_WAVEFORM = 1
++} audiocpp_yue2_progress_stage;
++typedef int (*audiocpp_yue2_progress_callback)(void * context, int stage, int completed, int total);
++AUDIOCPP_API audiocpp_status audiocpp_yue2_session_run_observed(
++    audiocpp_session * session, const audiocpp_request * request, audiocpp_yue2_pcm_callback pcm,
++    audiocpp_yue2_progress_callback progress, void * context, audiocpp_result ** out_result);
++
  /* ------------------------------------------------------------------ */
  /* Streaming                                                           */
  /* ------------------------------------------------------------------ */
 diff --git a/include/engine/models/yue2/pipeline.h b/include/engine/models/yue2/pipeline.h
-index 2d92228..e0c7d41 100644
+index 2d92228..7622413 100644
 --- a/include/engine/models/yue2/pipeline.h
 +++ b/include/engine/models/yue2/pipeline.h
 @@ -9,6 +9,7 @@
  #include "engine/models/yue2/request.h"
  #include "engine/models/yue2/tokenizer_text.h"
- 
+
 +#include <cstddef>
  #include <memory>
  #include <optional>
  #include <string>
-@@ -16,6 +17,13 @@
- 
+@@ -16,6 +17,15 @@
+
  namespace engine::models::yue2 {
- 
+
 +struct Yue2PCMObserver {
 +    int (*callback)(void *, const float *, size_t, int, int, size_t, size_t) = nullptr;
++    int (*progress)(void *, int, int, int) = nullptr;
 +    void * context = nullptr;
 +};
 +Yue2PCMObserver exchange_pcm_observer(Yue2PCMObserver observer);
++void report_synthesis_progress(int completed, int total);
 +
 +
  struct Yue2RunResult {
      std::optional<runtime::AudioBuffer> audio;
      std::string plan_abc_text;
 diff --git a/src/capi/audiocpp.cpp b/src/capi/audiocpp.cpp
-index 634b057..a856027 100644
+index 634b057..41782d6 100644
 --- a/src/capi/audiocpp.cpp
 +++ b/src/capi/audiocpp.cpp
 @@ -26,6 +26,7 @@
@@ -54,18 +67,24 @@ index 634b057..a856027 100644
  #include "engine/framework/runtime/session.h"
  #include "engine/framework/io/json.h"
 +#include "engine/models/yue2/pipeline.h"
- 
+
  #include <cstddef>
  #include <cstdint>
-@@ -722,6 +723,16 @@ audiocpp_status audiocpp_session_run(audiocpp_session * session,
+@@ -722,6 +723,22 @@ audiocpp_status audiocpp_session_run(audiocpp_session * session,
      });
  }
- 
+
 +audiocpp_status audiocpp_yue2_session_run_pcm(
 +    audiocpp_session * session, const audiocpp_request * request, audiocpp_yue2_pcm_callback callback,
 +    void * context, audiocpp_result ** out_result) {
++    return audiocpp_yue2_session_run_observed(session, request, callback, nullptr, context, out_result);
++}
++
++audiocpp_status audiocpp_yue2_session_run_observed(
++    audiocpp_session * session, const audiocpp_request * request, audiocpp_yue2_pcm_callback pcm,
++    audiocpp_yue2_progress_callback progress, void * context, audiocpp_result ** out_result) {
 +    using engine::models::yue2::exchange_pcm_observer;
-+    const auto previous = exchange_pcm_observer({callback, context});
++    const auto previous = exchange_pcm_observer({pcm, progress, context});
 +    const auto status = audiocpp_session_run(session, request, out_result);
 +    exchange_pcm_observer(previous);
 +    return status;
@@ -74,14 +93,69 @@ index 634b057..a856027 100644
  /* ------------------------------------------------------------------ */
  /* Request                                                             */
  /* ------------------------------------------------------------------ */
+diff --git a/src/models/yue2/nar_runtime.cpp b/src/models/yue2/nar_runtime.cpp
+index 0ecea0c..03b0a05 100644
+--- a/src/models/yue2/nar_runtime.cpp
++++ b/src/models/yue2/nar_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "engine/models/yue2/nar_runtime.h"
++#include "engine/models/yue2/pipeline.h"
+ #include "attention_layout.h"
+ #include "nar_conditioning.h"
+ #include "nar_windowing.h"
+@@ -690,7 +691,9 @@ struct Yue2NARRuntime::Impl {
+     std::vector<float> solve_chunk(
+         const Yue2ARDevicePrefixState & ar_state,
+         const std::vector<float> & noise,
+-        int64_t ode_steps) {
++        int64_t ode_steps,
++        int completed_steps,
++        int total_steps) {
+         auto state = noise;
+         const auto & config = assets->config.model;
+         const int64_t frames = static_cast<int64_t>(state.size()) / config.latent_dim;
+@@ -711,6 +714,7 @@ struct Yue2NARRuntime::Impl {
+             for (size_t i = 0; i < state.size(); ++i) {
+                 state[i] -= second[i] * dt;
+             }
++            report_synthesis_progress(completed_steps + static_cast<int>(step) + 1, total_steps);
+         }
+         return state;
+     }
+@@ -751,6 +755,9 @@ struct Yue2NARRuntime::Impl {
+         int64_t rendered_end = 0;
+         double prefill_ms = 0.0;
+         double solve_ms = 0.0;
++        int completed_steps = 0;
++        const int total_steps = static_cast<int>(ranges.size() * ode_steps);
++        report_synthesis_progress(completed_steps, total_steps);
+         for (const auto & [begin, end] : ranges) {
+             std::vector<int32_t> ar_tokens = prefix;
+             ar_tokens.reserve(prefix.size() + static_cast<size_t>(end - begin) + 1);
+@@ -768,7 +775,8 @@ struct Yue2NARRuntime::Impl {
+             auto ar_state = prefill_state(ar_tokens, prefix.size());
+             prefill_ms += engine::debug::elapsed_ms(prefill_start);
+             const auto solve_start = Clock::now();
+-            auto chunk = solve_chunk(ar_state, noise, ode_steps);
++            auto chunk = solve_chunk(ar_state, noise, ode_steps, completed_steps, total_steps);
++            completed_steps += static_cast<int>(ode_steps);
+             solve_ms += engine::debug::elapsed_ms(solve_start);
+             detail::blend_nar_chunk(out, chunk, begin, end, rendered_end, config.latent_dim);
+             rendered_end = end;
 diff --git a/src/models/yue2/pipeline.cpp b/src/models/yue2/pipeline.cpp
-index b9124f0..649469d 100644
+index b9124f0..41a119e 100644
 --- a/src/models/yue2/pipeline.cpp
 +++ b/src/models/yue2/pipeline.cpp
-@@ -15,6 +15,16 @@
+@@ -1,4 +1,5 @@
+ #include "engine/models/yue2/pipeline.h"
++#include "audiocpp.h"
+
+ #include "engine/framework/debug/profiler.h"
+ #include "engine/framework/debug/trace.h"
+@@ -15,6 +16,23 @@
  namespace engine::models::yue2 {
  namespace {
- 
+
 +thread_local Yue2PCMObserver pcm_observer;
 +
 +void deliver_pcm(const runtime::AudioBuffer & audio, size_t offset, size_t count, size_t total) {
@@ -92,21 +166,32 @@ index b9124f0..649469d 100644
 +    }
 +}
 +
++void report_progress(int stage, int completed, int total) {
++    const auto observer = pcm_observer;
++    if (observer.progress && observer.progress(observer.context, stage, completed, total) != 0) {
++        throw std::runtime_error("Yue2 rendering cancelled by the progress observer");
++    }
++}
++
  using Clock = std::chrono::steady_clock;
- 
+
  std::string request_text(const Yue2Request & request) {
-@@ -116,6 +126,10 @@ Yue2ARSamplingWindow semantic_window(const Yue2GenerationConfig & generation) {
- 
+@@ -116,6 +134,14 @@ Yue2ARSamplingWindow semantic_window(const Yue2GenerationConfig & generation) {
+
  }  // namespace
- 
+
 +Yue2PCMObserver exchange_pcm_observer(Yue2PCMObserver observer) {
 +    return std::exchange(pcm_observer, observer);
++}
++
++void report_synthesis_progress(int completed, int total) {
++    report_progress(AUDIOCPP_YUE2_SYNTHESIS, completed, total);
 +}
 +
  class Yue2PipelineRuntime::Impl {
  public:
      Impl(
-@@ -275,6 +289,8 @@ public:
+@@ -275,6 +301,8 @@ public:
              engine::debug::timing_log_scalar("yue2.vae_decode.tiles", 1);
              engine::debug::timing_log_scalar("yue2.vae_decode.tile_decode_ms", engine::debug::elapsed_ms(decode_start));
              engine::debug::timing_log_scalar("yue2.vae_decode.output_frames", static_cast<int64_t>(audio.samples.size()) / audio.channels);
@@ -114,8 +199,8 @@ index b9124f0..649469d 100644
 +            deliver_pcm(audio, 0, count, count);
              return audio;
          }
- 
-@@ -310,6 +326,7 @@ public:
+
+@@ -310,6 +338,7 @@ public:
                          tile_audio.samples[static_cast<size_t>((crop_start + t) * tile_audio.channels + c)];
                  }
              }
@@ -123,3 +208,11 @@ index b9124f0..649469d 100644
              ++tiles;
          }
          engine::debug::timing_log_scalar("yue2.vae_decode.tiles", tiles);
+@@ -382,6 +411,7 @@ public:
+             ar.reset();
+         }
+         const auto vae_start = Clock::now();
++        report_progress(AUDIOCPP_YUE2_WAVEFORM, 0, 0);
+         auto audio = decode_audio(latents, frames);
+         engine::debug::timing_log_scalar("yue2.vae_decode_ms", engine::debug::elapsed_ms(vae_start, Clock::now()));
+         if (mem_saver && vae) {

@@ -12,11 +12,12 @@ struct CLI {
                 return
             }
             guard args.count >= 4 else {
-                throw YuE2Failure.request("Usage: yue2-coreml ASSETS LYRICS.TXT STYLE.TXT OUTPUT.WAV [--seed N] [--frames N] [--minimum-frames N] [--fast-acoustic | --streaming-acoustic] [--embedded | --metal | --metal-paired | --worker PATH]")
+                throw YuE2Failure.request("Usage: yue2-coreml ASSETS LYRICS.TXT STYLE.TXT OUTPUT.WAV [--seed N] [--frames N] [--minimum-frames N] [--guidance-scale N] [--fast-acoustic | --streaming-acoustic] [--embedded | --metal | --metal-paired | --worker PATH]")
             }
             var seed: UInt64 = 20261122
             var frames: Int?
             var minimum = 200
+            var guidanceScale: Float?
             var acousticProfile: AcousticProfile?
             guard let executable = Bundle.main.executableURL else {
                 throw YuE2Failure.worker("The executable path is unavailable.")
@@ -55,6 +56,11 @@ struct CLI {
                 case "--minimum-frames":
                     guard let n = Int(value) else { throw YuE2Failure.request("Invalid minimum frame count.") }
                     minimum = n
+                case "--guidance-scale":
+                    guard let n = Float(value), n.isFinite, n >= 1 else {
+                        throw YuE2Failure.request("Text guidance must be a finite number of at least 1.")
+                    }
+                    guidanceScale = n
                 case "--worker":
                     execution = .isolated(worker: file(value))
                 default:
@@ -68,7 +74,7 @@ struct CLI {
             let request = SongRequest(lyrics: try String(contentsOf: file(args[1]), encoding: .utf8),
                                       style: try String(contentsOf: file(args[2]), encoding: .utf8),
                                       seed: seed, maximumFrames: frames, minimumFrames: minimum,
-                                      acousticProfile: acousticProfile)
+                                      acousticProfile: acousticProfile, guidanceScale: guidanceScale)
             let preview: (@Sendable (SongAudioPreview) -> Void)?
             if acousticProfile == .streaming {
                 let started = ContinuousClock.now

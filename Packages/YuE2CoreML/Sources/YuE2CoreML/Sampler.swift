@@ -22,7 +22,7 @@ struct Sampler {
 
     static func choose(
         _ logit: (Int, Int) -> Float, history: [Int], allowEnding: Bool,
-        random: inout RandomStream
+        guidanceScale: Float, random: inout RandomStream
     ) throws -> Int {
         // The sampler visits codec indices in order, so each recent token can use one bit.
         var repeated = [UInt64](repeating: 0, count: (TensorSpec.logits + 63) / 64)
@@ -36,7 +36,7 @@ struct Sampler {
         for index in (allowEnding ? 0 : 1) ..< TensorSpec.logits {
             let positive = logit(0, index)
             let negative = logit(1, index)
-            var score = negative + 1.01 * (positive - negative)
+            var score = negative + guidanceScale * (positive - negative)
             guard score.isFinite else { continue }
             let token = TensorSpec.musicEnd + index
             if repeated[index / 64] & (UInt64(1) << (index % 64)) != 0 {

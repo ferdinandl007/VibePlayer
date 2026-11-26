@@ -16,8 +16,11 @@ struct CreateSongView: View {
     @State private var styles = ""
     @State private var lyrics = ""
     @State private var instrumental = false
-    @AppStorage("vibe-create-acoustics") private var preferredAcoustics = ""
+    @AppStorage("vibe-create-acoustics") private var preferredInstrumentalAcoustics = ""
+    @AppStorage("vibe-create-vocal-acoustics") private var preferredVocalAcoustics = ""
     @AppStorage("vibe-create-length") private var preferredLength = ""
+    @AppStorage("vibe-create-follow-style-closely") private var followStyleClosely = true
+    @AppStorage("vibe-create-clear-lead-vocals") private var clearLeadVocals = false
     @State private var saved = false
     @State private var showSongwritingSettings = false
     @State private var showStyles = false
@@ -48,9 +51,8 @@ struct CreateSongView: View {
     private var showsPlayback: Bool { player.isPlaying || player.isGenerated || !player.isSample || player.isWaitingForRadio }
     private var acoustics: CreateAcoustics {
         if player.remixSource != nil { return .reference }
-        return CreateAcoustics.resolve(preference: preferredAcoustics, instrumental: instrumental,
-                                       supportsEarlyPlayback: player.canStreamAcoustics,
-                                       supportsFastFullSong: player.canFastFullSong)
+        let preference = instrumental ? preferredInstrumentalAcoustics : preferredVocalAcoustics
+        return CreateAcoustics.resolve(preference: preference, supportsEarlyPlayback: player.canStreamAcoustics)
     }
     private var length: CreateLength {
         if let preferred = CreateLength(rawValue: preferredLength), preferred != .extended || player.canCreateExtended {
@@ -142,10 +144,12 @@ struct CreateSongView: View {
             Text("Create").font(.largeTitle.weight(.semibold)).accessibilityAddTraits(.isHeader)
             Spacer(minLength: 4)
             Menu {
-                if player.canStreamAcoustics || player.canFastFullSong {
-                    Picker("Rendering", selection: Binding(get: { acoustics }, set: { preferredAcoustics = $0.rawValue })) {
-                        if player.canStreamAcoustics { Text("Early playback").tag(CreateAcoustics.streaming) }
-                        if player.canFastFullSong { Text("Fast Full Song").tag(CreateAcoustics.fastFullSong) }
+                if player.canStreamAcoustics {
+                    Picker("Rendering", selection: Binding(get: { acoustics }, set: { choice in
+                        if instrumental { preferredInstrumentalAcoustics = choice.rawValue }
+                        else { preferredVocalAcoustics = choice.rawValue }
+                    })) {
+                        Text("Early playback").tag(CreateAcoustics.streaming)
                         Text("High quality").tag(CreateAcoustics.reference)
                     }
                 }
@@ -156,6 +160,8 @@ struct CreateSongView: View {
                         Text("Extended (3½ min or more)").tag(CreateLength.extended)
                     }
                 }
+                Toggle("Follow style closely", isOn: $followStyleClosely)
+                if !instrumental { Toggle("Clear lead vocals", isOn: $clearLeadVocals) }
                 Button("Save idea", systemImage: "bookmark") { saveIdea() }.disabled(!canCreate)
                 Button("Songwriting settings", systemImage: "key") { showSongwritingSettings = true }
             } label: {
@@ -465,7 +471,8 @@ struct CreateSongView: View {
         let idea = hasPrompt ? prompt.trimmingCharacters(in: .whitespacesAndNewlines) : "Remix \(reference?.title ?? "the reference")"
         player.generateSong(idea: idea, instrumental: instrumental,
                             preparedLyrics: instrumental ? nil : lyrics.trimmingCharacters(in: .whitespacesAndNewlines),
-                            createStyles: styles, createLength: length, acoustics: acoustics, reference: reference)
+                            createStyles: styles, createLength: length, acoustics: acoustics, reference: reference,
+                            followStyleClosely: followStyleClosely, clearLeadVocals: clearLeadVocals)
         prompt = ""; styles = ""; lyrics = ""; instrumental = false; saved = false
         clearSample()
     }

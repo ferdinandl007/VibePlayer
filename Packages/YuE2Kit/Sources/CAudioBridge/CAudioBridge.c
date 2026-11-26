@@ -19,6 +19,8 @@ struct yu_engine {
     audiocpp_session *session;
     audiocpp_status (*session_run_pcm)(audiocpp_session *, const audiocpp_request *, yu_pcm_callback,
                                        void *, audiocpp_result **);
+    audiocpp_status (*session_run_observed)(audiocpp_session *, const audiocpp_request *, yu_pcm_callback,
+                                            yu_progress_callback, void *, audiocpp_result **);
 #define DECLARE(name) __typeof__(&audiocpp_##name) name;
     AUDIO_FUNCTIONS(DECLARE)
 #undef DECLARE
@@ -70,6 +72,7 @@ yu_engine *yu_open(const char *library, const char *weights, const char *spec, i
     AUDIO_FUNCTIONS(LOAD)
 #undef LOAD
     engine->session_run_pcm = (__typeof__(engine->session_run_pcm))dlsym(engine->library, "audiocpp_yue2_session_run_pcm");
+    engine->session_run_observed = (__typeof__(engine->session_run_observed))dlsym(engine->library, "audiocpp_yue2_session_run_observed");
 
     audiocpp_model_config model_config = {.family_hint = "yue2", .model_spec_override = spec};
     audiocpp_backend_config backend = {.backend = "metal", .device = 0, .threads = 8};
@@ -125,15 +128,17 @@ void yu_result_close(yu_result *result) {
 
 yu_result *yu_render(yu_engine *engine, const char *lyrics, const char *style,
                      uint64_t seed, int frames, int steps, int minimum_frames, const char *prefix) {
-    return yu_render_observing_pcm(engine, lyrics, style, seed, frames, steps, minimum_frames, prefix, NULL, NULL);
+    return yu_render_observed(engine, lyrics, style, seed, frames, steps, minimum_frames, prefix, "1.01", NULL, NULL, NULL);
 }
 
-int yu_supports_pcm(const yu_engine *engine) { return engine->session_run_pcm != NULL; }
+int yu_supports_pcm(const yu_engine *engine) { return engine->session_run_pcm != NULL || engine->session_run_observed != NULL; }
+int yu_supports_progress(const yu_engine *engine) { return engine->session_run_observed != NULL; }
 
-yu_result *yu_render_observing_pcm(yu_engine *engine, const char *lyrics, const char *style,
-                                   uint64_t seed, int frames, int steps, int minimum_frames,
-                                   const char *prefix, yu_pcm_callback callback, void *context) {
-    if (callback && !yu_supports_pcm(engine)) {
+yu_result *yu_render_observed(yu_engine *engine, const char *lyrics, const char *style,
+                              uint64_t seed, int frames, int steps, int minimum_frames,
+                              const char *prefix, const char *guidance_scale, yu_pcm_callback pcm, yu_progress_callback progress,
+                              void *context) {
+    if (pcm && !yu_supports_pcm(engine)) {
         fail("stream YuE2 waveform", "this audio.cpp library does not expose PCM tiles");
         return NULL;
     }
@@ -153,7 +158,7 @@ yu_result *yu_render_observing_pcm(yu_engine *engine, const char *lyrics, const 
     snprintf(minimum_text, sizeof(minimum_text), "%d", minimum_frames);
     snprintf(seed_text, sizeof(seed_text), "%" PRIu64, seed);
     const char *options[][2] = {
-        {"style", style}, {"seed", seed_text}, {"cot", "off"}, {"guidance_scale", "1.01"},
+        {"style", style}, {"seed", seed_text}, {"cot", "off"}, {"guidance_scale", guidance_scale},
         {"num_inference_steps", steps_text}, {"semantic_min_tokens", minimum_frames > 0 ? minimum_text : NULL},
         {"semantic_max_tokens", frames_text}, {"export_semantic", "true"}, {"semantic_prefix", prefix},
     };
@@ -162,9 +167,14 @@ yu_result *yu_render_observing_pcm(yu_engine *engine, const char *lyrics, const 
         if (options[i][1] && engine->request_set_option(request, options[i][0], options[i][1]) != AUDIOCPP_OK)
             goto failed;
     }
-    audiocpp_status status = callback
-        ? engine->session_run_pcm(engine->session, request, callback, context, &result->raw)
-        : engine->session_run(engine->session, request, &result->raw);
+    audiocpp_status status;
+    if ((pcm || progress) && engine->session_run_observed) {
+        status = engine->session_run_observed(engine->session, request, pcm, progress, context, &result->raw);
+    } else if (pcm) {
+        status = engine->session_run_pcm(engine->session, request, pcm, context, &result->raw);
+    } else {
+        status = engine->session_run(engine->session, request, &result->raw);
+    }
     if (status != AUDIOCPP_OK ||
         engine->result_audio(result->raw, &result->samples, &result->frames, &result->rate,
                              &result->channels) != AUDIOCPP_OK)

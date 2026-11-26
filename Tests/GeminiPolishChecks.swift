@@ -24,11 +24,12 @@ private final class GeminiStub: URLProtocol {
         }
         guard
               let body, let contents = String(data: body, encoding: .utf8),
-              (contents.contains("Polish the following lyrics") && contents.contains("original line")) || contents.contains("Reply with one short word") else {
+              (contents.contains("Polish the following lyrics") && contents.contains("original line")) ||
+                contents.contains("Reply with one short word") || contents.contains("Invent one original song title") else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse)); return
         }
         let response = HTTPURLResponse(url: url, statusCode: key == "bad-key" ? 403 : 200, httpVersion: nil, headerFields: nil)!
-        let result = key == "empty-key" ? "" : "Polished line"
+        let result = key == "empty-key" ? "" : contents.contains("Invent one original song title") ? "Under the Lanterns" : "Polished line"
         let data = "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\(result)\"}]},\"finishReason\":\"STOP\"}]}".data(using: .utf8)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: data)
@@ -74,6 +75,22 @@ private final class GeminiStub: URLProtocol {
         let request = MusicPromptBuilder().makeCreateRequest(idea: "the moon", styles: "folk", instrumental: false, seed: 1)
         let localLyrics = try await missingKey.writeLyrics(for: request)
         precondition(localLyrics == "[Verse]\nA local melody")
+
+        let localTitleWriter = GeminiLyricsWriter(readKey: { nil }, localCompletion: { prompt, _ in
+            precondition(prompt.contains("Invent one original song title") && prompt.contains("folk"))
+            return "Blue Porch Light"
+        })
+        let localTitle = try await localTitleWriter.suggestRadioTitle(for: request)
+        precondition(localTitle == "Blue Porch Light")
+
+        let cloudTitleWriter = GeminiLyricsWriter(session: URLSession(configuration: configuration),
+                                                  readKey: { "test-key" }, localCompletion: { _, _ in nil })
+        let cloudTitle = try await cloudTitleWriter.suggestRadioTitle(for: request)
+        precondition(cloudTitle == "Under the Lanterns")
+
+        let noTitleWriter = GeminiLyricsWriter(readKey: { nil }, localCompletion: { _, _ in nil })
+        let noTitle = try await noTitleWriter.suggestRadioTitle(for: request)
+        precondition(noTitle == nil)
         print("Gemini, offline songwriting, and key verification checks passed")
     }
 }

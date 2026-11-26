@@ -1,6 +1,6 @@
 # YuE2Kit
 
-YuE2Kit runs YuE2-3B in a macOS process using the audio.cpp C ABI and Metal. It accepts lyrics and a style, and gives callers interleaved 48 kHz stereo PCM for playback, export, or analysis. One engine owns one resident model session. Load it when a user enters the generation screen, and reuse it across requests.
+YuE2Kit runs YuE2-3B in a macOS or iOS process using the audio.cpp C ABI and Metal. It accepts lyrics and a style, and gives callers interleaved 48 kHz stereo PCM for playback, export, or analysis. One engine owns one resident model session.
 
 ## Runtime and weights
 
@@ -45,11 +45,23 @@ cmake -S "$work/audio.cpp" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$work/build" --parallel 8 --target audiocpp
 ```
 
-Copy the compiled library (following the symlink from `$work/build/bin/libaudiocpp.dylib`) to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm.dylib`. Vibe Player also needs its indexed `YuE2MetalAssets` bundle for composing. The optional library enables the hybrid route for High quality and long Radio songs when it exports the waveform callback. Audio begins after composition and full-song acoustic synthesis, during waveform decoding.
+Copy the compiled library (following the symlink from `$work/build/bin/libaudiocpp.dylib`) to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm.dylib`. Vibe Player also needs its indexed `YuE2MetalAssets` bundle for composing. The optional library enables the hybrid route for High quality and long Radio songs when it exports the waveform callback. The current patch also exports `audiocpp_yue2_session_run_observed` for live synthesis step counts and cancellation between steps. Rebuild older PCM runtimes to enable those updates. Audio begins after composition and full-song acoustic synthesis, during waveform decoding.
 
-To enable **Fast Full Song** on Mac, build a second copy of the PCM runtime with `Patches/audio-cpp-v0.9.6-wide-attention.patch` also applied. Copy the fast build to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm-fast.dylib`, set its install name to `@rpath/libaudiocpp-pcm-fast.dylib` with `install_name_tool -id`, and re-sign it with `codesign --force --sign -`. This mode uses the same eight midpoint steps and full song context. High Quality opens the standard PCM library.
+To enable the faster **High Quality** and Radio runtime on Mac, build a second copy of the PCM runtime with `Patches/audio-cpp-v0.9.6-wide-attention.patch` also applied. Copy the fast build to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm-fast.dylib`, set its install name to `@rpath/libaudiocpp-pcm-fast.dylib` with `install_name_tool -id`, and re-sign it with `codesign --force --sign -`. It uses the same eight midpoint steps and full song context. Keep the standard PCM library available for fallback.
 
 On M3 Max, the fast runtime selects a 32-query attention tile at 5,000 or more acoustic query rows. The wider tile reuses key and value loads across more queries while preserving the order of each query's operations. Shorter contexts use the 16-query tile where supported.
+
+### iPhone and iPad
+
+From the repository root, build the arm64 iOS 18+ framework with Xcode's device SDK and CMake. The script uses the same pinned audio.cpp release and waveform and attention patches as the optimized Mac runtime. Pass an existing audio.cpp checkout or `file://` clone URL as the first argument to build from a local mirror.
+
+```bash
+bash Packages/YuE2Kit/Scripts/build-ios-runtime.sh
+```
+
+Vibe Player embeds and signs the generated `Packages/YuE2Kit/.build/apple-mobile/YuE2Audio.framework` when building for `iphoneos`. Provision both `YuE2MetalAssets` and `YuE2NativeAssets` in the app's Application Support directory or app resources. The native directory contains `yue2.json` from audio.cpp v0.9.6 and the `weights` subdirectory described above. The indexed bundle supplies token composition, and the native bundle supplies acoustic synthesis and waveform decoding.
+
+High Quality and Radio select the embedded renderer when both bundles are available. After composition, the renderer loads the native session, runs eight midpoint steps with the whole song in context and emits PCM while decoding the waveform. The app releases that session before composing the next song. The current iOS song cap still applies, and an explicit Early Playback choice continues to use the windowed pipeline. Simulator builds and installations without the framework or native weights use the indexed renderer.
 
 ### Reference recordings on Mac
 

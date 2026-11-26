@@ -7,8 +7,10 @@ struct RootView: View {
     @State private var tab = 0
     @State private var showPlayer = ProcessInfo.processInfo.arguments.contains("--preview-player")
     @State private var showImporter = false
-    @State private var showNewStation = false
-    @State private var newStationName = ""
+    @State private var stationCategory: StationCategory?
+    @State private var stationSearch = ""
+    @State private var stationSource: Vibe?
+    @State private var openCreatedStation = false
     @State private var preparingRemix = false
 
     var body: some View {
@@ -20,11 +22,19 @@ struct RootView: View {
             case .failure: player.errorMessage = "Couldn't import this audio file. Please try again."
             }
         }
-        .alert("New station", isPresented: $showNewStation) {
-            TextField("Station name", text: $newStationName)
-            Button("Create") { player.createStation(named: newStationName); newStationName = ""; showPlayer = true }
-            Button("Cancel", role: .cancel) { newStationName = "" }
-        } message: { Text("Start with the current sound, then adjust it to make it your own.") }
+        .sheet(item: $stationSource, onDismiss: {
+            if openCreatedStation {
+                openCreatedStation = false
+                showPlayer = true
+            }
+        }) { source in
+            NewStationView(startingStation: source, catalog: player.vibes) { name, template, sound, instrumental in
+                if player.createStation(named: name, basedOn: template, soundDescription: sound, instrumental: instrumental) {
+                    openCreatedStation = true
+                    stationSource = nil
+                }
+            }
+        }
         .onAppear { if ProcessInfo.processInfo.arguments.contains("--preview-playing") { player.play() } }
         .alert("Vibe Player", isPresented: Binding(get: { player.errorMessage != nil }, set: { if !$0 { player.errorMessage = nil } })) {
             Button("OK", role: .cancel) { player.errorMessage = nil }
@@ -79,62 +89,19 @@ struct RootView: View {
         MiniPlayer { showPlayer = true }.padding(.horizontal, 12).padding(.bottom, 6)
     }
     private var discover: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 30) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("VIBE PLAYER").font(.system(size: 12, weight: .bold, design: .rounded)).tracking(2.4).foregroundStyle(.white.opacity(0.6))
-                        Text("Radio").font(.system(size: 32, weight: .bold, design: .rounded))
-                    }
-                    Spacer()
-                    Image(systemName: "waveform").font(.system(size: 19, weight: .semibold)).frame(width: 46, height: 46).background(.white.opacity(0.1), in: Circle())
-                }
-                .padding(.top, 12)
-
-                Button { if !player.radioMode { player.select(player.selected) }; showPlayer = true } label: {
-                    ZStack(alignment: .bottomLeading) {
-                        VibeArtwork(palette: player.selected.palette, variant: .hero)
-                        LinearGradient(colors: [.clear, .black.opacity(0.7)], startPoint: .center, endPoint: .bottom)
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("YOUR STATION").font(.caption2.weight(.bold)).tracking(1.6).foregroundStyle(.white.opacity(0.75))
-                            Text(player.selected.name).font(.system(size: 30, weight: .bold, design: .rounded))
-                            Text("Tune in and shape the sound").font(.subheadline).foregroundStyle(.white.opacity(0.75))
-                            HStack(spacing: 7) { Text("Open player"); Image(systemName: "arrow.up.right") }.font(.subheadline.weight(.semibold)).padding(.top, 8)
-                        }.padding(24)
-                    }.frame(height: 265).clipShape(RoundedRectangle(cornerRadius: 25))
-                }.buttonStyle(.plain).accessibilityIdentifier("open-current-station")
-
-                VStack(alignment: .leading, spacing: 16) {
-                    HStack {
-                        Text("Pick a station").font(.title2.bold())
-                        Spacer()
-                        Button { showNewStation = true } label: { Label("New station", systemImage: "plus") }
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 17) {
-                            ForEach(player.vibes) { vibe in
-                                Button { player.select(vibe); showPlayer = true } label: {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        VibeArtwork(palette: vibe.palette, variant: .disc).frame(width: 148, height: 148)
-                                        Text(vibe.name).font(.headline).lineLimit(1)
-                                        Text(vibe.subtitle).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-                                    }.frame(width: 148, alignment: .leading)
-                                }.buttonStyle(.plain).accessibilityIdentifier("station-\(vibe.name)")
-                            }
-                        }
-                    }
-                }
-                Button { showImporter = true } label: {
-                    HStack(spacing: 15) {
-                        Image(systemName: "waveform.badge.plus").font(.title2).frame(width: 48, height: 48).background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
-                        VStack(alignment: .leading, spacing: 4) { Text("Bring your own audio").font(.headline); Text("Play a file from your device").font(.subheadline).foregroundStyle(.secondary) }
-                        Spacer(); Image(systemName: "chevron.right").font(.caption.bold()).foregroundStyle(.secondary)
-                    }.padding(16).background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 20))
-                }.buttonStyle(.plain)
-            }.padding(.horizontal, 22).padding(.bottom, 24).frame(maxWidth: 1050).frame(maxWidth: .infinity)
-        }.background(Color(red: 0.045, green: 0.045, blue: 0.055)).vibeHideNavigationBar()
+        RadioView(category: $stationCategory, query: $stationSearch) {
+            if !player.radioMode { player.select(player.selected) }
+            showPlayer = true
+        } openStation: { station in
+            player.select(station)
+            showPlayer = true
+        } newStation: {
+            stationSource = player.selected
+        } importAudio: {
+            showImporter = true
+        }
     }
+
     private var library: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -176,7 +143,11 @@ struct RootView: View {
                     }
                 }
                 Text("Your vibes").font(.title2.bold())
-                ForEach(player.vibes) { vibe in
+                let stations = player.vibes.filter { StationCatalog.preset(for: $0) == nil || player.savedIDs.contains($0.id) }
+                if stations.isEmpty {
+                    Text("Stations you make or bookmark will appear here.").font(.subheadline).foregroundStyle(.secondary)
+                }
+                ForEach(stations) { vibe in
                     Button { player.select(vibe); showPlayer = true } label: {
                         HStack(spacing: 16) {
                             VibeArtwork(palette: vibe.palette, variant: .disc).frame(width: 72, height: 72)
@@ -270,15 +241,24 @@ struct VibeArtwork: View {
     enum Variant { case disc, hero }
     var palette: Int
     var variant: Variant
-    private var colors: [Color] {
-        switch palette % 3 {
+    static func colors(for palette: Int) -> [Color] {
+        switch palette {
         case 1: [.init(red: 0.84, green: 0.48, blue: 0.64), .init(red: 0.42, green: 0.37, blue: 0.75), .init(red: 0.90, green: 0.68, blue: 0.44)]
         case 2: [.init(red: 0.18, green: 0.58, blue: 0.51), .init(red: 0.20, green: 0.32, blue: 0.56), .init(red: 0.54, green: 0.65, blue: 0.48)]
+        case 3: [Color(red: 0.63, green: 0.19, blue: 0.23), Color(red: 0.15, green: 0.29, blue: 0.24), Color(red: 0.88, green: 0.56, blue: 0.33)]
+        case 4: [Color(red: 0.68, green: 0.30, blue: 0.13), Color(red: 0.40, green: 0.13, blue: 0.19), Color(red: 0.91, green: 0.47, blue: 0.17)]
+        case 5: [Color(red: 0.23, green: 0.37, blue: 0.58), Color(red: 0.14, green: 0.18, blue: 0.36), Color(red: 0.37, green: 0.56, blue: 0.69)]
+        case 6: [Color(red: 0.25, green: 0.45, blue: 0.40), Color(red: 0.15, green: 0.24, blue: 0.26), Color(red: 0.45, green: 0.61, blue: 0.43)]
+        case 7: [Color(red: 0.68, green: 0.28, blue: 0.45), Color(red: 0.39, green: 0.17, blue: 0.43), Color(red: 0.83, green: 0.42, blue: 0.59)]
+        case 8: [Color(red: 0.38, green: 0.28, blue: 0.61), Color(red: 0.19, green: 0.15, blue: 0.34), Color(red: 0.53, green: 0.43, blue: 0.79)]
+        case 9: [Color(red: 0.58, green: 0.36, blue: 0.20), Color(red: 0.35, green: 0.19, blue: 0.19), Color(red: 0.76, green: 0.52, blue: 0.28)]
+        case 10: [Color(red: 0.24, green: 0.41, blue: 0.49), Color(red: 0.15, green: 0.22, blue: 0.34), Color(red: 0.46, green: 0.62, blue: 0.66)]
         default: [.init(red: 0.31, green: 0.50, blue: 0.72), .init(red: 0.54, green: 0.37, blue: 0.65), .init(red: 0.73, green: 0.55, blue: 0.34)]
         }
     }
     var body: some View {
         GeometryReader { geometry in
+            let colors = Self.colors(for: palette)
             ZStack {
                 AngularGradient(colors: colors + [colors[0]], center: .center).blur(radius: variant == .disc ? 10 : 35)
                 if variant == .disc {

@@ -166,21 +166,63 @@ final class VibePlayerUITests: XCTestCase {
         like.tap()
         XCTAssertTrue(app.buttons["Saved to library"].waitForExistence(timeout: 5))
         let ready = app.staticTexts["radio-ready-count"]
-        let twoReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "2 ready"), object: ready)
-        XCTAssertEqual(XCTWaiter.wait(for: [twoReady], timeout: 10), .completed)
+        let queueFull = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "10 ready"), object: ready)
+        XCTAssertEqual(XCTWaiter.wait(for: [queueFull], timeout: 10), .completed)
         XCTAssertEqual(app.descendants(matching: .any).matching(identifier: "radio-queued-track").count, 2)
+        XCTAssertTrue(app.buttons["radio-queue-disclosure"].exists)
         capture("Radio playback and ready queue")
-        app.buttons["Forward 15 seconds"].tap()
+        app.buttons["Next song"].tap()
         XCTAssertTrue(app.buttons["Like and save song"].waitForExistence(timeout: 15), "Radio should advance to the prepared next song")
+        let previous = app.buttons["Previous song"]
+        let canGoBack = XCTNSPredicateExpectation(predicate: enabled, object: previous)
+        XCTAssertEqual(XCTWaiter.wait(for: [canGoBack], timeout: 8), .completed)
+        previous.tap()
+        XCTAssertTrue(app.buttons["Saved to library"].waitForExistence(timeout: 5))
         app.buttons["Close player"].tap()
         app.tabBars.buttons["Library"].tap()
-        XCTAssertTrue(app.staticTexts["Lofi Beats"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["Song options"].waitForExistence(timeout: 5))
         app.terminate()
         app.launchArguments = ["--fixture-renderer"]
         app.launch()
         app.tabBars.buttons["Library"].tap()
-        XCTAssertTrue(app.staticTexts["Lofi Beats"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.buttons["Song options"].exists)
+        XCTAssertTrue(app.buttons["Song options"].waitForExistence(timeout: 10))
+    }
+    func testRadioPlaylistSupportsSkippingAndSeeking() throws {
+        app.terminate()
+        app.launchArguments = ["--ui-testing", "--fixture-renderer"]
+        app.launch()
+        XCTAssertTrue(app.buttons["open-current-station"].waitForExistence(timeout: 20))
+        app.buttons["open-current-station"].tap()
+        app.buttons["player-playback"].tap()
+
+        let current = app.buttons["radio-playlist-current"]
+        let upNext = app.buttons.matching(identifier: "radio-queued-track")
+        XCTAssertTrue(current.waitForExistence(timeout: 15))
+        XCTAssertTrue(upNext.element(boundBy: 1).waitForExistence(timeout: 10))
+        let titles = [current.label, upNext.element(boundBy: 0).label, upNext.element(boundBy: 1).label]
+        XCTAssertEqual(Set(titles).count, 3)
+
+        let next = app.buttons["Next song"]
+        let previous = app.buttons["Previous song"]
+        next.tap()
+        XCTAssertEqual(current.label, titles[1])
+        next.tap()
+        XCTAssertEqual(current.label, titles[2])
+        previous.tap()
+        XCTAssertEqual(current.label, titles[1])
+        previous.tap()
+        XCTAssertEqual(current.label, titles[0])
+        XCTAssertFalse(previous.isEnabled)
+        XCTAssertEqual(upNext.element(boundBy: 0).label, titles[1])
+        XCTAssertEqual(upNext.element(boundBy: 1).label, titles[2])
+
+        app.buttons["player-playback"].tap()
+        let seek = app.sliders["radio-seek"]
+        let position = try XCTUnwrap(seek.value as? String)
+        seek.adjust(toNormalizedSliderPosition: 0.55)
+        XCTAssertNotEqual(seek.value as? String, position)
+        XCTAssertEqual(current.label, titles[0])
+        capture("Radio playlist and playback position")
     }
     func testSwipeDownClosesRadioPlayer() throws {
         XCTAssertTrue(app.buttons["open-current-station"].waitForExistence(timeout: 20))
@@ -240,7 +282,8 @@ final class VibePlayerUITests: XCTestCase {
     }
     func testPromptedSongIsSaved() throws {
         app.terminate()
-        app.launchArguments = ["--ui-testing", "--fixture-renderer", "--fixture-full-context-audio"]
+        app.launchArguments = ["--ui-testing", "--fixture-renderer", "--fixture-full-context-audio",
+                               "-vibe-create-acoustics", "streaming"]
         app.launch()
         app.tabBars.buttons["Create"].tap()
         let prompt = app.textViews["song-prompt"]
@@ -332,6 +375,25 @@ final class VibePlayerUITests: XCTestCase {
             XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 8), .completed)
         }
     }
+    func testReadyRadioKeepsPlayingInBackground() throws {
+        app.terminate()
+        app.launchArguments = ["--ui-testing", "--fixture-renderer"]
+        app.launch()
+        XCTAssertTrue(app.buttons["open-current-station"].waitForExistence(timeout: 20))
+        app.buttons["open-current-station"].tap()
+        app.buttons["player-playback"].tap()
+        XCTAssertTrue(app.buttons.matching(identifier: "radio-queued-track").firstMatch.waitForExistence(timeout: 15))
+        let current = app.buttons["radio-playlist-current"]
+        let titleBeforeBackground = current.label
+
+        XCUIDevice.shared.press(.home)
+        RunLoop.current.run(until: Date().addingTimeInterval(15))
+        XCTAssertEqual(app.state, .runningBackground)
+        app.activate()
+        XCTAssertNotEqual(current.label, titleBeforeBackground)
+        XCTAssertTrue(app.buttons["Previous song"].isEnabled, "Radio should advance to a ready song while in the background")
+        XCTAssertEqual(app.buttons["player-playback"].label, "Pause")
+    }
     func testTempoChangeReplacesThePlayingRadioSong() throws {
         app.terminate()
         app.launchArguments = ["--ui-testing", "--fixture-renderer"]
@@ -347,20 +409,60 @@ final class VibePlayerUITests: XCTestCase {
 
         let tempo = app.descendants(matching: .any).matching(identifier: "tempo-control").firstMatch
         XCTAssertTrue(tempo.exists)
+        if !tempo.isHittable { app.swipeUp() }
         let start = tempo.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.5))
         let end = tempo.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.5))
         start.press(forDuration: 0.1, thenDragTo: end)
 
+        XCTAssertTrue(app.staticTexts["radio-sound-change"].waitForExistence(timeout: 2))
         XCTAssertTrue(like.waitForExistence(timeout: 8), "The changed tempo should produce a replacement song during playback")
         XCTAssertEqual(app.buttons["player-playback"].label, "Pause")
     }
+    func testBrowseStationCatalog() throws {
+        let count = app.staticTexts["station-count"]
+        XCTAssertTrue(count.waitForExistence(timeout: 15))
+        XCTAssertEqual(count.label, "50 stations")
+        capture("Station catalog")
+
+        app.buttons["Christmas"].tap()
+        XCTAssertEqual(count.label, "7 stations")
+        let search = app.textFields["station-search"]
+        search.tap()
+        search.typeText("jazz\n")
+        XCTAssertEqual(count.label, "1 station")
+        let jazz = app.buttons["station-Christmas Jazz"]
+        XCTAssertTrue(jazz.waitForExistence(timeout: 5))
+        capture("Christmas station search")
+        jazz.tap()
+        XCTAssertTrue(app.staticTexts["Christmas Jazz"].waitForExistence(timeout: 5))
+    }
+
     func testCreateCustomStation() throws {
-        XCTAssertTrue(app.buttons["New station"].waitForExistence(timeout: 15))
-        app.buttons["New station"].tap()
-        let name = app.alerts["New station"].textFields.firstMatch
+        let newStation = app.buttons["New station"]
+        XCTAssertTrue(newStation.waitForExistence(timeout: 15))
+        newStation.tap()
+        let name = app.textFields["new-station-name"]
+        let create = app.buttons["create-station"]
         XCTAssertTrue(name.waitForExistence(timeout: 5))
-        name.tap(); name.typeText("Night Drive")
-        app.alerts["New station"].buttons["Create"].tap()
+        XCTAssertFalse(create.isEnabled)
+        app.buttons["new-station-template"].tap()
+        app.buttons["From scratch"].tap()
+        app.buttons["new-station-template"].tap()
+        app.collectionViews.buttons["Workout"].tap()
+        app.collectionViews.buttons["Power Hour"].tap()
+        XCTAssertEqual(app.buttons["new-station-template"].value as? String, "Power Hour")
+        capture("New station")
+        name.tap()
+        name.typeText("Night Drive")
+        XCTAssertTrue(create.isHittable)
+        create.tap()
+        XCTAssertTrue(app.staticTexts["Night Drive"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["sound-control-music.note-Electro house"].exists)
+
+        app.terminate()
+        app.launchArguments = []
+        app.launch()
+        app.buttons["Library"].firstMatch.tap()
         XCTAssertTrue(app.staticTexts["Night Drive"].waitForExistence(timeout: 5))
     }
     func testLandscapeNavigation() throws {

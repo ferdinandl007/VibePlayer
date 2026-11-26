@@ -216,7 +216,8 @@ struct Decoder {
                     let row = firstBranch + (branches == 1 ? 0 : branch)
                     return Float(data[row * stride[0] + index * stride[2]])
                 },
-                history: history, allowEnding: history.count >= stage.request.minimumFrames, random: &random)
+                history: history, allowEnding: history.count >= stage.request.minimumFrames,
+                guidanceScale: stage.request.guidanceScale ?? 1.01, random: &random)
         }
     }
 

@@ -14,6 +14,7 @@ struct MusicProfile: Equatable, Sendable {
     let name: String
     let traits: [Trait]
     let tempo: Double
+    var soundDescription: String? = nil
 }
 
 enum CreateRenderer: Sendable {
@@ -34,17 +35,10 @@ enum CreateLength: String, Sendable {
 }
 
 enum CreateAcoustics: String, Sendable {
-    case streaming, reference, fastFullSong
+    case streaming, reference
 
-    static func resolve(preference: String, instrumental: Bool, supportsEarlyPlayback: Bool,
-                        supportsFastFullSong: Bool = false) -> Self {
-        if preference == Self.fastFullSong.rawValue { return supportsFastFullSong ? .fastFullSong : .reference }
-        guard supportsEarlyPlayback else { return .reference }
-        #if os(macOS)
-        return Self(rawValue: preference) ?? .reference
-        #else
-        return Self(rawValue: preference) ?? (instrumental ? .streaming : .reference)
-        #endif
+    static func resolve(preference: String, supportsEarlyPlayback: Bool) -> Self {
+        supportsEarlyPlayback && preference == Self.streaming.rawValue ? .streaming : .reference
     }
 }
 
@@ -52,6 +46,10 @@ enum CreateAcoustics: String, Sendable {
 struct MusicGenerationRequest: Equatable, Sendable {
     enum Voice: Sendable { case instrumental, vocals, unspecified }
     enum Purpose: Sendable { case radio, createdSong }
+    struct RadioSuccessor: Equatable, Sendable {
+        let seed: UInt64
+        let style: String
+    }
     let stationName: String
     var style: String
     private(set) var lyrics: String
@@ -64,8 +62,9 @@ struct MusicGenerationRequest: Equatable, Sendable {
     var createRenderer: CreateRenderer = .metal
     var minimumSemanticFrames = 200
     var createAcoustics: CreateAcoustics = .reference
+    var guidanceScale: Float? = nil
     var semanticPrefix: [Int] = []
-    var radioSuccessorSeed: UInt64?
+    var radioSuccessor: RadioSuccessor?
 
     func withLyrics(_ lyrics: String) -> MusicGenerationRequest {
         var request = self
@@ -75,9 +74,33 @@ struct MusicGenerationRequest: Equatable, Sendable {
 }
 
 struct MusicPromptBuilder {
+    static let radioArrangements = [
+        "syncopated lead phrases and a steady bass ostinato",
+        "rolling arpeggios and a light offbeat groove",
+        "legato melody and slowly changing layered harmonies",
+        "short call-and-response motifs and a shuffled rhythm",
+        "a sparse opening that builds into a wide, layered refrain",
+        "a half-time feel with a low-register melodic hook",
+        "alternating bright and dark chords with a rising melody",
+        "a simple descending melody with a contrasting rhythmic bridge",
+        "a flowing bass melody and short, punctuated chords",
+        "a stop-and-start groove and a long, sustained refrain"
+    ]
+
+    static func radioTitle(seed: UInt64) -> String {
+        let modifiers = ["Amber", "Blue", "Clouded", "Distant", "Evening", "Fading", "Golden", "Harbor", "Hidden",
+                         "Indigo", "Late", "Lunar", "Midnight", "Morning", "Paper", "Quiet", "Silver", "Soft", "Velvet", "Winter"]
+        let nouns = ["Arcade", "Avenue", "Breeze", "Current", "Daydream", "Echoes", "Frequency", "Gardens",
+                     "Horizon", "Lanterns", "Light", "Mirage", "Orbit", "Rain", "Rooftops", "Signal", "Skies", "Tide", "Transit", "Waves"]
+        let adjective = modifiers[Int(seed % UInt64(modifiers.count))]
+        let noun = nouns[Int(seed / UInt64(modifiers.count) % UInt64(nouns.count))]
+        return "\(adjective) \(noun)"
+    }
+
     /// The Create screen starts with its own description instead of inheriting a radio station.
     func makeCreateRequest(idea: String, styles: String, instrumental: Bool, seed: UInt64,
-                           length: CreateLength = .automatic) -> MusicGenerationRequest {
+                           length: CreateLength = .automatic, followStyleClosely: Bool = false,
+                           clearLeadVocals: Bool = false) -> MusicGenerationRequest {
         let voice: MusicGenerationRequest.Voice = instrumental ? .instrumental : .vocals
         var parts = [instrumental ? "instrumental" : "vocal music"]
         let cleanStyles = styles.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -85,8 +108,12 @@ struct MusicPromptBuilder {
         if length == .fullSong { parts.append("full arrangement with a closing section") }
         if length == .extended { parts.append("extended arrangement with a closing section") }
         if !cleanStyles.isEmpty { parts.append("styles: " + cleanStyles) }
+        if clearLeadVocals && !instrumental { parts.append("upfront lead vocal, clear diction, light vocal reverb") }
         if !cleanIdea.isEmpty { parts.append("song idea: " + cleanIdea) }
-        return MusicGenerationRequest(stationName: "Your song", style: parts.joined(separator: "; "), lyrics: "", voice: voice, purpose: .createdSong, seed: seed, maxSemanticFrames: length.maximumFrames, synthesisSteps: 8, createRenderer: .metal, minimumSemanticFrames: length.minimumFrames)
+        return MusicGenerationRequest(stationName: "Your song", style: parts.joined(separator: "; "), lyrics: "",
+                                      voice: voice, purpose: .createdSong, seed: seed, maxSemanticFrames: length.maximumFrames,
+                                      synthesisSteps: 8, minimumSemanticFrames: length.minimumFrames,
+                                      guidanceScale: followStyleClosely ? 1.2 : nil)
     }
 
     func makeRequest(profile: MusicProfile, seed: UInt64, maxSemanticFrames: Int = 5_000, idea: String = "", voiceOverride: MusicGenerationRequest.Voice? = nil) -> MusicGenerationRequest {
@@ -128,13 +155,16 @@ struct MusicPromptBuilder {
         if !instruments.isEmpty { parts.append("instruments: " + instruments.joined(separator: ", ")) }
         let tempo = profile.tempo.isFinite ? min(180, max(50, profile.tempo.rounded())) : 90
         parts.append("\(Int(tempo)) BPM")
+        if let description = profile.soundDescription?.trimmingCharacters(in: .whitespacesAndNewlines), !description.isEmpty {
+            parts.append("sound direction: " + description)
+        }
         let cleanIdea = idea.trimmingCharacters(in: .whitespacesAndNewlines)
         if !cleanIdea.isEmpty { parts.append("song idea: " + cleanIdea) }
         return MusicGenerationRequest(stationName: profile.name, style: parts.joined(separator: "; "), lyrics: "", voice: voiceMode, purpose: .radio, seed: seed, maxSemanticFrames: maxSemanticFrames, synthesisSteps: 8)
     }
 
     func makeRadioPlaybackRequest(profile: MusicProfile, seed: UInt64, idea: String,
-                                  voiceOverride: MusicGenerationRequest.Voice?) -> MusicGenerationRequest {
+                                  voiceOverride: MusicGenerationRequest.Voice?, arrangement: Int) -> MusicGenerationRequest {
         #if os(macOS)
         var request = makeRequest(profile: profile, seed: seed, maxSemanticFrames: CreateLength.fullSong.maximumFrames,
                                   idea: idea, voiceOverride: voiceOverride)
@@ -145,6 +175,7 @@ struct MusicPromptBuilder {
                                   idea: idea, voiceOverride: voiceOverride)
         request.minimumSemanticFrames = 2_000
         #endif
+        request.style += "; " + Self.radioArrangements[arrangement % Self.radioArrangements.count]
         return request
     }
 }
@@ -156,11 +187,11 @@ protocol MusicGenerationBackend {
     var isAvailable: Bool { get }
     var canUsePairedMetal: Bool { get }
     var canStreamAcoustics: Bool { get }
-    var canFastFullSong: Bool { get }
     var canCreateExtended: Bool { get }
     var canPrepareRadioPair: Bool { get }
     func prepareEarlyPlayback()
     func waitForIdle() async throws
+    func releaseResources() async
     func promptUsage(for request: MusicGenerationRequest) async throws -> MusicPromptUsage?
     func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
                   onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput
@@ -347,17 +378,17 @@ struct MusicPromptUsage: Sendable {
 }
 
 enum MusicGenerationProgress: Sendable {
-    case tokens(Int, Int), synthesis(Int, Int), waveform
+    case tokens(Int, Int), synthesizing, synthesis(Int, Int), waveform
 }
 
 extension MusicGenerationBackend {
     var canPrepareRadioPair: Bool { false }
     var canUsePairedMetal: Bool { false }
     var canStreamAcoustics: Bool { false }
-    var canFastFullSong: Bool { false }
     var canCreateExtended: Bool { false }
     func prepareEarlyPlayback() {}
     func waitForIdle() async throws {}
+    func releaseResources() async {}
     func promptUsage(for request: MusicGenerationRequest) async throws -> MusicPromptUsage? { nil }
 }
 
@@ -370,13 +401,12 @@ struct UnavailableMusicGenerationBackend: MusicGenerationBackend {
 }
 
 enum MusicGenerationError: LocalizedError {
-    case unavailable, metalUnavailable, extendedUnavailable, fastFullSongUnavailable, invalidReference, referenceEncoderUnavailable, promptTooLong(count: Int, limit: Int)
+    case unavailable, metalUnavailable, extendedUnavailable, invalidReference, referenceEncoderUnavailable, promptTooLong(count: Int, limit: Int)
     var errorDescription: String? {
         switch self {
         case .unavailable: "Song generation isn't available yet."
         case .metalUnavailable: "The Metal music model is unavailable on this device."
         case .extendedUnavailable: "Extended songs require the 4:16 Metal model. Select Automatic length to use the installed model."
-        case .fastFullSongUnavailable: "Fast Full Song couldn't load its Mac audio runtime. Choose High Quality to render with the standard runtime."
         case .invalidReference: "Couldn't use this opening. Choose a valid YuE2 reference or a generated song with an available audio file."
         case .referenceEncoderUnavailable: "Import YuE2 semantic codes, or use a Mac with the Reference Audio model installed to import a recording."
         case .promptTooLong(let count, let limit): "The description and lyrics use \(count) tokens. The music model can use \(limit). Shorten the description or reduce the lyrics, then create again."

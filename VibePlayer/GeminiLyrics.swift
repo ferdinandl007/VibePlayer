@@ -63,6 +63,7 @@ protocol LyricsWriter {
     func writeLyrics(for request: MusicGenerationRequest) async throws -> String
     func rewriteIdea(_ idea: String, styles: String) async throws -> String?
     func reviseForMusicModel(_ text: String, field: MusicPromptField, targetTokens: Int) async throws -> String?
+    func suggestRadioTitle(for request: MusicGenerationRequest) async throws -> String?
 }
 
 enum MusicPromptField: String { case description, lyrics }
@@ -70,6 +71,7 @@ enum MusicPromptField: String { case description, lyrics }
 extension LyricsWriter {
     func rewriteIdea(_ idea: String, styles: String) async throws -> String? { nil }
     func reviseForMusicModel(_ text: String, field: MusicPromptField, targetTokens: Int) async throws -> String? { nil }
+    func suggestRadioTitle(for request: MusicGenerationRequest) async throws -> String? { nil }
 }
 
 struct GeminiLyricsWriter: LyricsWriter {
@@ -104,10 +106,25 @@ struct GeminiLyricsWriter: LyricsWriter {
         return text
     }
 
+    func suggestRadioTitle(for request: MusicGenerationRequest) async throws -> String? {
+        let prompt = """
+        Invent one original song title of two to five words that fits this music. Return only the title.
+        Station: \(request.stationName)
+        Sound: \(request.style.prefix(500))
+        Lyrics excerpt: \(request.lyrics.prefix(400))
+        """
+        if let local = try? await localCompletion(prompt, 32), !local.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return local
+        }
+        try Task.checkCancellation()
+        guard let key = try readKey(), !key.isEmpty else { return nil }
+        return try await complete(prompt, apiKey: key, maxOutputTokens: 256, timeout: 5)
+    }
+
     func reviseForMusicModel(_ text: String, field: MusicPromptField, targetTokens: Int) async throws -> String? {
         let guidance = field == .lyrics
             ? "Keep the language, story, section labels, and closing lines. Keep repeated refrains identical. Use fewer, shorter lines with common words that are easy to sing clearly."
-            : "Keep the genre, mood, tempo, instruments, voice or instrumental choice, and the core idea. Use a compact description."
+            : "Keep the genre, mood, tempo, instruments, core idea, and instrumental choice or vocal details such as diction and placement in the mix. Use a compact description."
         let prompt = "Rewrite this song \(field.rawValue) to fit within about \(targetTokens) music-model tokens (aim for \(max(4, targetTokens / 2)) words or fewer). \(guidance) Return only the revised \(field.rawValue). Do not add commentary or Markdown fences.\n\n\(text)"
         return try await preferredCompletion(prompt, localLimit: max(32, targetTokens))
     }

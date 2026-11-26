@@ -15,11 +15,27 @@ import Testing
 @Test func samplerResumesFromCheckpointAndMasksEarlyEnding() throws {
     var original = RandomStream(state: 42)
     let logits: (Int, Int) -> Float = { _, index in index <= 2 ? Float(3 - index) : -.infinity }
-    _ = try Sampler.choose(logits, history: [], allowEnding: false, random: &original)
+    _ = try Sampler.choose(logits, history: [], allowEnding: false, guidanceScale: 1.01, random: &original)
     var restored = RandomStream(state: original.state)
-    let a = try Sampler.choose(logits, history: [], allowEnding: false, random: &original)
-    let b = try Sampler.choose(logits, history: [], allowEnding: false, random: &restored)
+    let a = try Sampler.choose(logits, history: [], allowEnding: false, guidanceScale: 1.01, random: &original)
+    let b = try Sampler.choose(logits, history: [], allowEnding: false, guidanceScale: 1.01, random: &restored)
     #expect(a != TensorSpec.musicEnd)
     #expect(a == b)
     #expect(original.state == restored.state)
+}
+
+@Test func strongerTextGuidanceChangesTheTokenChoice() throws {
+    func logits(_ branch: Int, _ index: Int) -> Float {
+        switch index {
+        case 1: branch == 0 ? 9 : 20
+        case 2: branch == 0 ? 4 : -25
+        default: -.infinity
+        }
+    }
+    var baseline = RandomStream(state: 42)
+    var stronger = baseline
+    let original = try Sampler.choose(logits, history: [], allowEnding: false, guidanceScale: 1.01, random: &baseline)
+    let guided = try Sampler.choose(logits, history: [], allowEnding: false, guidanceScale: 1.2, random: &stronger)
+    #expect(original == TensorSpec.musicEnd + 1)
+    #expect(guided == TensorSpec.musicEnd + 2)
 }

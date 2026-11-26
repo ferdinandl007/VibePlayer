@@ -12,6 +12,9 @@ struct PlayerView: View {
     @ScaledMetric(relativeTo: .subheadline) private var tempoWidth: CGFloat = 122
     @State private var editingTags = false
     @State private var showImporter = false
+    @State private var showFullQueue = false
+    @State private var radioScrubPosition: Double?
+    @State private var soundChangeToShow: UUID?
     @State private var dragOffset: CGFloat = 0
     @State private var scrollAtTop = true
     @State private var dragStartedAtTop: Bool?
@@ -42,6 +45,27 @@ struct PlayerView: View {
             }.offset(y: dragOffset)
         }
         .tint(.white).vibePlayerControls()
+        .overlay(alignment: .bottom) {
+            if player.radioMode, soundChangeToShow != nil {
+                Text("Sound changes apply to the next song generated.")
+                    .font(.subheadline.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 18).padding(.vertical, 11)
+                    .foregroundStyle(.white)
+                    .background(.black.opacity(0.86), in: Capsule())
+                    .padding(.horizontal, 16).padding(.bottom, 16)
+                    .allowsHitTesting(false)
+                    .accessibilityIdentifier("radio-sound-change")
+            }
+        }
+        .onChange(of: player.radioSoundChangeID) { _, id in soundChangeToShow = id }
+        .task(id: soundChangeToShow) {
+            guard let id = soundChangeToShow else { return }
+            AccessibilityNotification.Announcement("Sound changes apply to the next song generated.").post()
+            do { try await Task.sleep(for: .seconds(3)) }
+            catch { return }
+            if soundChangeToShow == id { soundChangeToShow = nil }
+        }
         .sheet(isPresented: $editingTags) { TagEditor() }
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.audio]) { result in
             switch result {
@@ -172,7 +196,7 @@ struct PlayerView: View {
                     Label(player.radioLoadingMessage != nil ? "Cancel preparation" : "Prepare songs", systemImage: player.radioLoadingMessage != nil ? "xmark" : "sparkles")
                         .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).padding(12)
                 }.buttonStyle(.plain).background(.white.opacity(0.12), in: Capsule()).accessibilityIdentifier("generate-song")
-                    .disabled(player.radioReadyCount == 2 && player.radioLoadingMessage == nil)
+                    .disabled(player.radioReadyCount >= player.radioQueueCapacity && player.radioLoadingMessage == nil)
             } else {
                 Text(MusicGenerationError.metalUnavailable.localizedDescription).font(.footnote).foregroundStyle(.white.opacity(0.6))
             }
@@ -197,10 +221,13 @@ struct PlayerView: View {
                 currentRadioTrack
                 trackActions
             }
+            if player.canSeek && (!player.isWaitingForRadio || player.isGenerated) {
+                radioSeekBar
+            }
             radioTransport
             if player.canGenerate {
                 Rectangle().fill(.white.opacity(0.12)).frame(height: 1).accessibilityHidden(true)
-                radioQueue
+                radioPlaylist
             }
         }
         .padding(16)
@@ -228,9 +255,6 @@ struct PlayerView: View {
                     .font(.headline).lineLimit(2)
                 if isWaiting {
                     Text("Waiting for audio").font(.caption).foregroundStyle(.white.opacity(0.74))
-                } else if player.duration > 0 {
-                    Text("\(time(player.elapsed)) / \(time(player.duration))")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.74))
                 }
             }
         }
@@ -255,6 +279,8 @@ struct PlayerView: View {
                 }.accessibilityLabel(player.disliked ? "Remove dislike" : "Dislike")
             }.vibeGlass()
             Menu {
+                Button("Restart song", systemImage: "arrow.counterclockwise") { player.seek(0) }
+                    .disabled(!player.canSeek)
                 Button("Import audio", systemImage: "square.and.arrow.down") { showImporter = true }
             } label: {
                 Image(systemName: "ellipsis").frame(width: 44, height: 44).vibeGlassCircle()
@@ -262,41 +288,64 @@ struct PlayerView: View {
         }
     }
 
-    private var radioQueue: some View {
-        let ready = player.radioReadyTracks
+    private var radioSeekBar: some View {
+        VStack(spacing: 3) {
+            Slider(value: Binding(
+                get: { min(radioScrubPosition ?? player.elapsed, player.duration) },
+                set: { position in
+                    if radioScrubPosition == nil { player.seek(position) }
+                    else { radioScrubPosition = position }
+                }
+            ), in: 0...max(player.duration, 0.001), onEditingChanged: { scrubbing in
+                if scrubbing {
+                    radioScrubPosition = player.elapsed
+                } else if let position = radioScrubPosition {
+                    radioScrubPosition = nil
+                    player.seek(position)
+                }
+            })
+            .tint(RadioConsoleColors.lavender)
+            .accessibilityLabel("Playback position")
+            .accessibilityIdentifier("radio-seek")
+            HStack {
+                Text(time(radioScrubPosition ?? player.elapsed))
+                Spacer()
+                Text(time(player.duration))
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.white.opacity(0.74))
+            .accessibilityHidden(true)
+        }
+        .onChange(of: player.trackName) { radioScrubPosition = nil }
+    }
+
+    private var radioPlaylist: some View {
+        let playlist = player.radioPlaylistItems
+        let current = playlist.firstIndex { $0.position == .current }
+        let first = max(0, (current ?? 0) - 1)
+        let end = min(playlist.count, (current ?? -1) + 3)
+        let shown = showFullQueue ? playlist[...] : playlist[first..<end]
         let loading = player.radioLoadingMessage != nil
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Up Next").font(.headline).accessibilityAddTraits(.isHeader)
+                Text("Playlist").font(.headline).accessibilityAddTraits(.isHeader)
                 Spacer()
-                if !ready.isEmpty {
-                    Text("\(ready.count) ready")
+                if player.radioReadyCount > 0 {
+                    Text("\(player.radioReadyCount) ready")
                         .font(.caption.weight(.medium)).foregroundStyle(.white.opacity(0.72))
                         .accessibilityIdentifier("radio-ready-count")
                 }
             }
             VStack(spacing: 0) {
-                ForEach(ready, id: \.id) { track in
-                    HStack(spacing: 10) {
-                        Image(systemName: "music.note")
-                            .font(.subheadline.weight(.semibold)).foregroundStyle(RadioConsoleColors.lavender)
-                            .frame(width: 38, height: 38)
-                            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-                            .accessibilityHidden(true)
-                        Text(track.station).font(.subheadline.weight(.semibold))
-                        Spacer(minLength: 8)
-                        if track.duration > 0 {
-                            Text(time(track.duration)).font(.caption.monospacedDigit())
-                                .foregroundStyle(.white.opacity(0.72))
-                        }
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.caption.weight(.semibold)).foregroundStyle(RadioConsoleColors.lavender)
-                            .accessibilityHidden(true)
-                    }
-                    .padding(.vertical, 5)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityValue("Ready")
-                    .accessibilityIdentifier("radio-queued-track")
+                ForEach(shown) { track in playlistRow(track) }
+                if playlist.count > end - first {
+                    Button(showFullQueue ? "Show less" : "Show all \(playlist.count) songs") { showFullQueue.toggle() }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(RadioConsoleColors.lavender)
+                        .buttonStyle(.plain)
+                        .frame(minHeight: 44)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("radio-queue-disclosure")
                 }
                 if loading {
                     let stage = player.radioRenderStage
@@ -315,7 +364,7 @@ struct PlayerView: View {
                     .accessibilityValue(player.isWaitingForRadio ? "Waiting for audio" : "Preparing in the background")
                     .accessibilityIdentifier("radio-loading")
                 }
-                if ready.isEmpty && !loading {
+                if playlist.isEmpty && !loading {
                     Text("Songs are queued as you listen.")
                         .font(.subheadline).foregroundStyle(.white.opacity(0.72))
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -325,12 +374,67 @@ struct PlayerView: View {
         }
     }
 
+    private func playlistRow(_ track: RadioPlaylistItem) -> some View {
+        let isCurrent = track.position == .current
+        let status = switch track.position {
+        case .earlier: "Earlier"
+        case .current: player.isPlaying ? "Playing" : "Current"
+        case .upcoming: "Ready"
+        }
+        return Button { player.playRadioSong(track.id) } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isCurrent ? "waveform" : "music.note")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(RadioConsoleColors.lavender)
+                    .frame(width: 38, height: 38)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(track.title).font(.subheadline.weight(.semibold))
+                    if isCurrent { Text(status).font(.caption).foregroundStyle(RadioConsoleColors.lavender) }
+                }
+                Spacer(minLength: 8)
+                Text(time(track.duration)).font(.caption.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.72))
+            }
+            .padding(6)
+            .background(RadioConsoleColors.lavender.opacity(isCurrent ? 0.12 : 0), in: RoundedRectangle(cornerRadius: 13))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(track.title)
+        .accessibilityValue(status)
+        .accessibilityHint(isCurrent ? "Restarts this song" : "Plays this song")
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
+        .accessibilityIdentifier(isCurrent ? "radio-playlist-current" : track.position == .upcoming ? "radio-queued-track" : "radio-playlist-earlier")
+    }
+
     private var radioTransport: some View {
+        ViewThatFits(in: .horizontal) {
+            radioTransport(showJumps: true)
+            radioTransport(showJumps: false)
+        }
+    }
+
+    private func radioTransport(showJumps: Bool) -> some View {
         HStack(spacing: 0) {
-            Button { player.seek(0) } label: { Image(systemName: "clock.arrow.circlepath").font(.title2).frame(width: 44, height: 48) }.accessibilityLabel("Restart audio")
+            if player.canGenerate {
+                Button { player.playPreviousRadioSong() } label: {
+                    Image(systemName: "backward.end.fill").font(.title2).frame(width: 44, height: 48)
+                }
+                .accessibilityLabel("Previous song")
+                .disabled(!player.canPlayPreviousRadioSong)
+            } else {
+                Button { player.seek(0) } label: {
+                    Image(systemName: "clock.arrow.circlepath").font(.title2).frame(width: 44, height: 48)
+                }.accessibilityLabel("Restart audio")
+            }
             Spacer()
-            Button { player.seek(player.elapsed - 15) } label: { Image(systemName: "backward.fill").font(.title2).frame(width: 44, height: 48) }.accessibilityLabel("Back 15 seconds")
-            Spacer()
+            if showJumps {
+                Button { player.seek(player.elapsed - 15) } label: { Image(systemName: "gobackward.15").font(.title3).frame(width: 44, height: 48) }
+                    .accessibilityLabel("Back 15 seconds").disabled(!player.canSeek)
+                Spacer()
+            }
             Button { player.togglePlayback() } label: {
                 Image(systemName: player.wantsPlayback ? "pause.fill" : "play.fill")
                     .font(.system(size: 23, weight: .semibold))
@@ -339,8 +443,19 @@ struct PlayerView: View {
                     .background(RadioConsoleColors.lavender, in: Circle())
             }.buttonStyle(.plain).accessibilityLabel(player.wantsPlayback ? "Pause" : "Play").accessibilityIdentifier("player-playback")
             Spacer()
-            Button { player.seek(player.elapsed + 15) } label: { Image(systemName: "forward.fill").font(.title2).frame(width: 44, height: 48) }.accessibilityLabel("Forward 15 seconds")
-            Spacer()
+            if showJumps {
+                Button { player.seek(player.elapsed + 15) } label: { Image(systemName: "goforward.15").font(.title3).frame(width: 44, height: 48) }
+                    .accessibilityLabel("Forward 15 seconds").disabled(!player.canSeek)
+                Spacer()
+            }
+            if player.canGenerate {
+                Button { player.playNextRadioSong() } label: {
+                    Image(systemName: "forward.end.fill").font(.title2).frame(width: 44, height: 48)
+                }
+                .accessibilityLabel("Next song")
+                .disabled(!player.canPlayNextRadioSong)
+                Spacer()
+            }
             Menu {
                 Button("15 minutes") { player.setSleepTimer(15) }
                 Button("30 minutes") { player.setSleepTimer(30) }

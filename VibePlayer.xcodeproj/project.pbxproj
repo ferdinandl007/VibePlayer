@@ -22,6 +22,8 @@
 		C088027DAB36E07F08DCFD60 /* VibePlayerUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B226ED7E38C6D07A01018361 /* VibePlayerUITests.swift */; };
 		C62959087AC077DAC8B7E55A /* atmosphere.wav in Resources */ = {isa = PBXBuildFile; fileRef = 4AC9E93C0B280BE27AB00184 /* atmosphere.wav */; };
 		F17E00000000000000000001 /* MusicGeneration.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17E00000000000000000002 /* MusicGeneration.swift */; };
+		F17E00000000000000000005 /* StationCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17E00000000000000000006 /* StationCatalog.swift */; };
+		F17E00000000000000000007 /* RadioView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17E00000000000000000008 /* RadioView.swift */; };
 		F17E00000000000000000003 /* GeminiLyrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = F17E00000000000000000004 /* GeminiLyrics.swift */; };
 /* End PBXBuildFile section */
 
@@ -50,6 +52,8 @@
 		E9C462A0D89E462501786D0A /* VibePlayerApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VibePlayerApp.swift; sourceTree = "<group>"; };
 		EA4BBA69316023F5C8268CEB /* PlayerStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PlayerStore.swift; sourceTree = "<group>"; };
 		F17E00000000000000000002 /* MusicGeneration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicGeneration.swift; sourceTree = "<group>"; };
+		F17E00000000000000000006 /* StationCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StationCatalog.swift; sourceTree = "<group>"; };
+		F17E00000000000000000008 /* RadioView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RadioView.swift; sourceTree = "<group>"; };
 		F17E00000000000000000004 /* GeminiLyrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeminiLyrics.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -103,6 +107,8 @@
 				EA4BBA69316023F5C8268CEB /* PlayerStore.swift */,
 				1F3AA0CCD8BED13BE26FE62E /* PlayerView.swift */,
 				52428ED6801AC2EA5C8CB85A /* RootView.swift */,
+				F17E00000000000000000008 /* RadioView.swift */,
+				F17E00000000000000000006 /* StationCatalog.swift */,
 				E9C462A0D89E462501786D0A /* VibePlayerApp.swift */,
 				522A92E4813748CFCAD45B08 /* Resources */,
 				C0FE7819D74EA835C58EE19C /* CreateSongView.swift */,
@@ -175,6 +181,7 @@
 				F209864001A73D0BD40337D6 /* Sources */,
 				74F3CEDA7F696AA8F2215240 /* Frameworks */,
 				CC75B6147C5A69A2BD96BEEE /* Resources */,
+				AEE200000000000000000009 /* Embed iOS Metal Runtime */,
 			);
 			buildRules = (
 			);
@@ -236,6 +243,21 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		AEE200000000000000000009 /* Embed iOS Metal Runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ("$(SRCROOT)/Packages/YuE2Kit",);
+			name = "Embed iOS Metal Runtime";
+			outputPaths = ("$(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/YuE2Audio.framework",);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"$SRCROOT/Packages/YuE2Kit/Scripts/embed-ios-runtime.sh\"";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		CEEC266D3DEF5AB7271D9297 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -256,6 +278,8 @@
 				4D0DC81F15A5EF284AB8F5A2 /* PlayerStore.swift in Sources */,
 				A593230B1F8B32236F7E8CAD /* PlayerView.swift in Sources */,
 				788113D023EAAA76DF7DB126 /* RootView.swift in Sources */,
+				F17E00000000000000000007 /* RadioView.swift in Sources */,
+				F17E00000000000000000005 /* StationCatalog.swift in Sources */,
 				069989F5C00EE14019654F13 /* VibePlayerApp.swift in Sources */,
 				AE9665BB2F96868814AF4D98 /* CreateSongView.swift in Sources */,
 			);
@@ -356,7 +380,8 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_UIBackgroundModes = audio;
+				"INFOPLIST_FILE[sdk=iphoneos*]" = VibePlayer/Info.plist;
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = VibePlayer/Info.plist;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
@@ -454,7 +479,8 @@
 				CLANG_ENABLE_OBJC_WEAK = NO;
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_UIBackgroundModes = audio;
+				"INFOPLIST_FILE[sdk=iphoneos*]" = VibePlayer/Info.plist;
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = VibePlayer/Info.plist;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";

@@ -67,7 +67,11 @@ private final class RadioTestRenderer: MusicGenerationBackend {
                   onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
         requests.append(request)
         let index = requests.count
+        onProgress(.synthesizing)
+        onProgress(.synthesis(1, 8))
         while index > readyThrough { try await Task.sleep(for: .milliseconds(10)) }
+        onProgress(.synthesis(8, 8))
+        onProgress(.waveform)
         let url = directory.appendingPathComponent("\(index).wav")
         let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 8_000, channels: 1, interleaved: true)!
         let frames = AVAudioFrameCount((3 + index * 3) * 8_000)
@@ -77,7 +81,7 @@ private final class RadioTestRenderer: MusicGenerationBackend {
         let file = try AVAudioFile(forWriting: url, settings: format.settings,
                                    commonFormat: .pcmFormatInt16, interleaved: true)
         try file.write(from: buffer)
-        return MusicGenerationOutput(url: url, radioSuccessorSeed: request.radioSuccessorSeed)
+        return MusicGenerationOutput(url: url, radioSuccessorSeed: request.radioSuccessor?.seed)
     }
 }
 #endif
@@ -86,27 +90,22 @@ private final class RadioTestRenderer: MusicGenerationBackend {
 struct CreateFlowChecks {
     @MainActor static func main() async throws {
         try checkPreviewFadesAndDoesNotSkipFrames()
-        precondition(CreateAcoustics.resolve(preference: "", instrumental: false, supportsEarlyPlayback: true) == .reference)
-        #if os(macOS)
-        precondition(CreateAcoustics.resolve(preference: "", instrumental: true, supportsEarlyPlayback: true) == .reference)
-        #else
-        precondition(CreateAcoustics.resolve(preference: "", instrumental: true, supportsEarlyPlayback: true) == .streaming)
-        #endif
-        precondition(CreateAcoustics.resolve(preference: "streaming", instrumental: false, supportsEarlyPlayback: true) == .streaming)
-        precondition(CreateAcoustics.resolve(preference: "reference", instrumental: true, supportsEarlyPlayback: true) == .reference)
-        precondition(CreateAcoustics.resolve(preference: "streaming", instrumental: false, supportsEarlyPlayback: false) == .reference)
-        precondition(CreateAcoustics.resolve(preference: "fastFullSong", instrumental: true, supportsEarlyPlayback: true) == .reference)
-        precondition(CreateAcoustics.resolve(preference: "fastFullSong", instrumental: true, supportsEarlyPlayback: false,
-                                             supportsFastFullSong: true) == .fastFullSong)
+        precondition(CreateAcoustics.resolve(preference: "", supportsEarlyPlayback: true) == .reference)
+        precondition(CreateAcoustics.resolve(preference: "streaming", supportsEarlyPlayback: true) == .streaming)
+        precondition(CreateAcoustics.resolve(preference: "reference", supportsEarlyPlayback: true) == .reference)
+        precondition(CreateAcoustics.resolve(preference: "streaming", supportsEarlyPlayback: false) == .reference)
+        precondition(CreateAcoustics.resolve(preference: "fastFullSong", supportsEarlyPlayback: true) == .reference)
         let writer = TestWriter()
         let renderer = TestRenderer()
         let player = PlayerStore(generationBackend: renderer, lyricsWriter: writer)
 
-        player.generateSong(idea: "rough idea", instrumental: false, createStyles: "jazz")
+        player.generateSong(idea: "rough idea", instrumental: false, createStyles: "jazz", clearLeadVocals: true)
         try await Task.sleep(nanoseconds: 60_000_000)
         precondition(player.isCreating && player.creationStatus.contains("50"))
         precondition(writer.lyricsRequest?.style.contains("A polished idea") == true)
         precondition(renderer.request?.style.contains("A polished idea") == true)
+        precondition(renderer.request?.style.contains("clear diction") == true)
+        precondition(renderer.request?.guidanceScale == 1.2)
         precondition(renderer.request?.lyrics == "Original lyrics")
         precondition(renderer.request?.createRenderer == .metal)
         precondition(renderer.receivedPreview && renderer.request?.createAcoustics == .reference)
@@ -114,9 +113,11 @@ struct CreateFlowChecks {
         precondition(!player.isCreating && player.errorMessage == "Test renderer failed")
 
         writer.failRewrite = true
-        player.generateSong(idea: "original idea", instrumental: true, createStyles: "ambient", acoustics: .streaming)
+        player.generateSong(idea: "original idea", instrumental: true, createStyles: "ambient", acoustics: .streaming,
+                            followStyleClosely: false, clearLeadVocals: true)
         try await Task.sleep(nanoseconds: 60_000_000)
         precondition(renderer.request?.style.contains("original idea") == true)
+        precondition(renderer.request?.style.contains("clear diction") == false && renderer.request?.guidanceScale == nil)
         precondition(renderer.receivedPreview)
         precondition(player.creationNotice?.contains("original") == true)
         player.cancelGeneration()
@@ -150,7 +151,7 @@ struct CreateFlowChecks {
         precondition(!player.isGenerating && player.errorMessage == MusicGenerationError.metalUnavailable.errorDescription)
         #if os(macOS)
         try await checkRadioKeepsPlayingAfterLateEdit()
-        try await checkRadioUsesPreparedSuccessor()
+        try await checkRadioFillsQueueAndUsesPreparedSuccessor()
         #endif
         print("Create flow checks passed")
     }
@@ -161,6 +162,7 @@ struct CreateFlowChecks {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let renderer = RadioTestRenderer(directory: directory)
+        renderer.readyThrough = 1
         let player = PlayerStore(generationBackend: renderer, lyricsWriter: TestWriter())
         let savedBefore = player.savedSongs.map(\.id)
         defer { player.pause(); player.cancelRadioPreparation() }
@@ -172,25 +174,41 @@ struct CreateFlowChecks {
         }
 
         player.play()
+        try await waitFor { player.isPlaying && renderer.requests.count == 2 && player.radioRenderStage.detail == "Step 1 of 8" }
+        precondition(player.duration == 6 && player.radioReadyCount == 0)
+        renderer.readyThrough = 2
         try await waitFor { player.isPlaying && renderer.requests.count == 3 }
         precondition(player.duration == 6 && player.radioReadyCount == 1)
+        let queuedSong = player.radioPlaylistItems.first { $0.position == .upcoming }!
 
         let tempo = player.selected.tempo == 60 ? 80.0 : 60.0
+        player.setTempo(tempo, commit: false)
+        precondition(player.radioPlaylistItems.filter { $0.position == .upcoming }.map(\.id) == [queuedSong.id])
         player.setTempo(tempo, commit: true)
+        precondition(player.radioSoundChangeID != nil)
+        precondition(player.radioPlaylistItems.filter { $0.position == .upcoming }.map(\.id) == [queuedSong.id])
         player.seek(player.duration - 1)
         try await waitFor { player.isPlaying && player.duration == 9 && renderer.requests.count == 4 }
-        precondition(renderer.requests.last?.style.contains("\(Int(tempo)) BPM") == true)
+        precondition(player.trackName == queuedSong.title && renderer.requests.last?.style.contains("\(Int(tempo)) BPM") == true)
 
         renderer.readyThrough = 4
-        try await waitFor { player.isPlaying && player.duration == 15 }
+        try await waitFor { player.isPlaying && player.duration == 15 && renderer.requests.count == 5 }
+        let updatedTitle = player.trackName
+        precondition(player.canPlayPreviousRadioSong && player.elapsed < 2)
+        try await Task.sleep(for: .milliseconds(2_100))
+        player.playPreviousRadioSong()
+        precondition(player.trackName == queuedSong.title && player.duration == 9 && player.canPlayPreviousRadioSong)
+        player.seek(player.duration - 1)
+        try await waitFor { player.isPlaying && player.trackName == updatedTitle }
         precondition(player.savedSongs.map(\.id) == savedBefore)
     }
-    @MainActor private static func checkRadioUsesPreparedSuccessor() async throws {
+    @MainActor private static func checkRadioFillsQueueAndUsesPreparedSuccessor() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let renderer = RadioTestRenderer(directory: directory)
         renderer.canPrepareRadioPair = true
+        renderer.readyThrough = 10
         let player = PlayerStore(generationBackend: renderer, lyricsWriter: TestWriter())
         player.vibes[player.selectedIndex].tags.removeAll { $0.category == .voice }
         player.vibes[player.selectedIndex].tags.append(SoundTag(name: "Instrumental", symbol: "music.note", category: .voice))
@@ -198,13 +216,32 @@ struct CreateFlowChecks {
         player.prepareRadio()
 
         let deadline = ContinuousClock.now.advanced(by: .seconds(4))
-        while player.radioReadyCount < 2, ContinuousClock.now < deadline {
+        while player.radioReadyCount < 10, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
-        precondition(player.radioReadyCount == 2 && renderer.requests.count == 2)
-        let first = renderer.requests[0], second = renderer.requests[1]
-        precondition(first.radioSuccessorSeed == second.seed && first.seed != second.seed)
-        precondition(second.radioSuccessorSeed == nil)
+        precondition(player.radioReadyCount == 10 && renderer.requests.count == 10 && !player.isGenerating)
+        precondition(Set(player.radioPlaylistItems.map(\.title)).count == 10)
+        precondition(Set(renderer.requests.map(\.style)).count == 10)
+        let paired = renderer.requests[2], successor = renderer.requests[3]
+        precondition(renderer.requests[0].radioSuccessor == nil)
+        precondition(renderer.requests[1].radioSuccessor == nil)
+        precondition(paired.radioSuccessor?.seed == successor.seed && paired.seed != successor.seed)
+        precondition(paired.radioSuccessor?.style == successor.style && paired.style != successor.style)
+        precondition(successor.radioSuccessor == nil)
+
+        let readyIDs = player.radioPlaylistItems.map(\.id)
+        player.setTempo(player.selected.tempo == 60 ? 80 : 60, commit: true)
+        let updateDeadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while renderer.requests.count < 11, ContinuousClock.now < updateDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        precondition(renderer.requests.count == 11 && player.radioPlaylistItems.map(\.id) == readyIDs)
+        renderer.readyThrough = 11
+        while player.isGenerating, ContinuousClock.now < updateDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        precondition(!player.isGenerating && player.radioReadyCount == 10)
+        precondition(Array(player.radioPlaylistItems.dropFirst().map(\.id)) == Array(readyIDs.dropLast()))
     }
     #endif
 

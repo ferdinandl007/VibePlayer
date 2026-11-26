@@ -10,7 +10,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "CAudioBridge"),
-        .target(name: "YuE2Kit", dependencies: [.target(name: "CAudioBridge", condition: .when(platforms: [.macOS]))]),
+        .target(name: "YuE2Kit", dependencies: ["CAudioBridge"]),
         .executableTarget(name: "YuE2Bench", dependencies: ["YuE2Kit"]),
     ]
 )

@@ -19,9 +19,12 @@ public struct SongRequest: Codable, Equatable, Sendable {
     public var minimumFrames: Int
     /// An opening to keep, expressed as zero-based semantic codec indices.
     public var semanticPrefix: [Int]?
+    /// Semantic classifier-free guidance for the style and lyrics. Omit to use the direct-mode default.
+    public var guidanceScale: Float?
 
     public init(lyrics: String, style: String, seed: UInt64, maximumFrames: Int? = nil,
-                minimumFrames: Int = 200, acousticProfile: AcousticProfile? = nil, semanticPrefix: [Int]? = nil) {
+                minimumFrames: Int = 200, acousticProfile: AcousticProfile? = nil, semanticPrefix: [Int]? = nil,
+                guidanceScale: Float? = nil) {
         self.acousticProfile = acousticProfile
         self.lyrics = lyrics
         self.style = style
@@ -29,6 +32,7 @@ public struct SongRequest: Codable, Equatable, Sendable {
         self.maximumFrames = maximumFrames
         self.minimumFrames = minimumFrames
         self.semanticPrefix = semanticPrefix
+        self.guidanceScale = guidanceScale
     }
 }
 
@@ -421,6 +425,14 @@ struct ModelAssets: Sendable {
             throw YuE2Failure.assets("There are no decoder capacities.")
         }
         let limit = request.maximumFrames ?? ceiling
+        if let scale = request.guidanceScale {
+            guard scale.isFinite, scale >= 1 else {
+                throw YuE2Failure.request("Text guidance must be a finite number of at least 1.")
+            }
+            guard manifest.batch == 2 else {
+                throw YuE2Failure.request("Adjustable text guidance requires a two-branch model bundle.")
+            }
+        }
         guard (128...ceiling).contains(limit), (128...limit).contains(request.minimumFrames),
               !request.style.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               request.lyrics.utf8.count + request.style.utf8.count <= 32768 else {
