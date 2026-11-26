@@ -9,7 +9,7 @@ struct SoundTag: Identifiable, Codable, Equatable {
 }
 
 enum TagCategory: String, CaseIterable, Codable, Identifiable {
-    case genre = "Genres", mood = "Moods", instrument = "Instruments", voice = "Voice"
+    case genre = "Genres", mood = "Moods", instrument = "Instruments", voice = "Voice", language = "Language"
     var id: String { rawValue }
 }
 
@@ -30,12 +30,15 @@ struct Vibe: Identifiable, Codable {
             case .mood: category = .mood
             case .instrument: category = .instrument
             case .voice: category = .voice
+            case .language: category = .language
             }
             return .init(name: tag.name, category: category, intensity: tag.intensity)
         }, tempo: tempo, soundDescription: soundDescription)
     }
     var prompt: String { MusicPromptBuilder().makeRequest(profile: musicProfile, seed: 0).style }
 }
+
+let vocalLanguages = ["English", "German", "French", "Italian", "Spanish", "Portuguese", "Mandarin Chinese", "Japanese", "Korean"]
 
 let tagOptions: [SoundTag] = [
     .init(name: "Boom bap", symbol: "headphones", category: .genre),
@@ -61,7 +64,7 @@ let tagOptions: [SoundTag] = [
     .init(name: "Handclaps", symbol: "hands.clap.fill", category: .instrument),
     .init(name: "Instrumental", symbol: "mic.slash.fill", category: .voice),
     .init(name: "Vocals", symbol: "mic.fill", category: .voice)
-]
+] + vocalLanguages.map { SoundTag(name: $0, symbol: "globe", category: .language) }
 
 enum StationCategory: String, CaseIterable, Identifiable {
     case christmas = "Christmas"

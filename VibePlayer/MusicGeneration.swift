@@ -5,7 +5,7 @@ import AVFoundation
 
 /// A snapshot of the controls, independent of the player UI and the model runtime.
 struct MusicProfile: Equatable, Sendable {
-    enum Category: String, Sendable { case genre, mood, instrument, voice }
+    enum Category: String, Sendable { case genre, mood, instrument, voice, language }
     struct Trait: Equatable, Sendable {
         let name: String
         let category: Category
@@ -130,13 +130,14 @@ struct MusicPromptBuilder {
             return "\(emphasis) \(trait.name.lowercased())"
         }
         let voices = values(.voice)
+        let language = values(.language).first?.name
         let voice = voices.first { $0.name.caseInsensitiveCompare("Instrumental") == .orderedSame || $0.name.caseInsensitiveCompare("Vocals") == .orderedSame }
         let voiceMode: MusicGenerationRequest.Voice
         if let voiceOverride {
             voiceMode = voiceOverride
         } else if let voice {
             voiceMode = voice.name.caseInsensitiveCompare("Instrumental") == .orderedSame ? .instrumental : .vocals
-        } else if profile.traits.contains(where: { $0.category == .voice }) {
+        } else if language == nil, profile.traits.contains(where: { $0.category == .voice }) {
             voiceMode = .unspecified
         } else {
             voiceMode = .vocals
@@ -144,7 +145,7 @@ struct MusicPromptBuilder {
         var parts: [String] = []
         switch voiceMode {
         case .instrumental: parts.append("instrumental")
-        case .vocals: parts.append("vocal music")
+        case .vocals: parts.append(language.map { "vocals sung in \($0)" } ?? "vocal music")
         case .unspecified: break
         }
         let genres = values(.genre).map(description)

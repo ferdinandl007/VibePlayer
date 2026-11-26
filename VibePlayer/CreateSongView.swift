@@ -658,7 +658,8 @@ private struct SongTextEditor: View {
                 if kind == .styles {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            ForEach(["mellow", "orchestral", "R&B", "synthwave", "atmospheric", "lo-fi"], id: \.self) { suggestion in
+                            ForEach(["mellow", "orchestral", "R&B", "synthwave", "atmospheric", "lo-fi"] +
+                                    vocalLanguages.map { "\($0) vocals" }, id: \.self) { suggestion in
                                 Button(suggestion) { draft += draft.isEmpty ? suggestion : ", " + suggestion }
                                     .font(.subheadline).padding(.horizontal, 16).frame(height: 42).vibeGlass()
                             }

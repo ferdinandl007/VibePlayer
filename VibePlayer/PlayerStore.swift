@@ -425,7 +425,9 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanName.isEmpty else { return false }
         let description = soundDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        var tags = (source?.tags ?? []).filter { $0.name != "Vocals" && $0.name != "Instrumental" }
+        var tags = (source?.tags ?? []).filter { tag in
+            tag.name != "Vocals" && tag.name != "Instrumental" && (!instrumental || tag.category != .language)
+        }
         if let voice = tagOptions.first(where: { $0.name == (instrumental ? "Instrumental" : "Vocals") }) {
             tags.append(voice)
         }

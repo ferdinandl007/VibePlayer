@@ -18,6 +18,13 @@ final class VibePlayerUITests: XCTestCase {
         app.buttons["station-Joyful Pop"].tap()
         XCTAssertTrue(app.buttons["Add"].waitForExistence(timeout: 10))
         capture("Player")
+        let language = app.buttons["radio-language"]
+        language.tap()
+        let french = app.buttons["French"]
+        XCTAssertTrue(french.waitForExistence(timeout: 5))
+        french.tap()
+        app.buttons["Done"].tap()
+        XCTAssertEqual(language.value as? String, "French")
         app.buttons["Add"].tap()
         XCTAssertTrue(app.navigationBars["Shape your sound"].waitForExistence(timeout: 5))
         capture("Sound picker")

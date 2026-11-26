@@ -61,6 +61,10 @@ struct TagEditor: View {
     @FocusState private var searchFocused: Bool
     private let customKey = "vibe-player-custom-sounds-v1"
 
+    init(showVoice: Bool = false) {
+        _section = State(initialValue: showVoice ? .voice : .genres)
+    }
+
     private var baseSounds: [PickerSound] {
         tagOptions.map { tag in
             let group: SoundSection
@@ -68,7 +72,7 @@ struct TagEditor: View {
             case .genre: group = .genres
             case .mood: group = .moods
             case .instrument: group = .instruments
-            case .voice: group = .voice
+            case .voice, .language: group = .voice
             }
             return PickerSound(section: group, tag: tag)
         } + extraPickerSounds
@@ -106,12 +110,12 @@ struct TagEditor: View {
                     }.padding(14).background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
 
                     if section == .voice {
-                        Text("Choose vocals or instrumental. You can change this anytime.")
+                        Text("Choose a vocal language or go instrumental.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     FlowLayout(spacing: 10) {
                         ForEach(options) { option in
-                            let selected = selection.contains { $0.name.localizedCaseInsensitiveCompare(option.tag.name) == .orderedSame }
+                            let selected = isSelected(option.tag)
                             Button { toggle(option.tag) } label: {
                                 Label(option.tag.name, systemImage: option.tag.symbol)
                                     .font(.subheadline.weight(.semibold)).padding(.horizontal, 16).frame(height: 44)
@@ -135,7 +139,7 @@ struct TagEditor: View {
                         Text("\(match.tag.name) is in \(match.section.rawValue).")
                             .font(.subheadline).foregroundStyle(.secondary)
                     } else if options.isEmpty {
-                        Text(section == .voice ? "Choose vocals or instrumental." : "No sounds found.")
+                        Text("No sounds found.")
                             .foregroundStyle(.secondary).frame(maxWidth: .infinity).padding()
                     }
                     if trimmedSearch.count > 24 {
@@ -162,12 +166,27 @@ struct TagEditor: View {
         }
         .vibePickerPresentation()
     }
-    private func toggle(_ tag: SoundTag) {
-        if selection.contains(where: { $0.name.localizedCaseInsensitiveCompare(tag.name) == .orderedSame }) {
-            selection.removeAll { $0.name.localizedCaseInsensitiveCompare(tag.name) == .orderedSame }
-        } else {
-            if tag.category == .voice { selection.removeAll { $0.category == .voice } }
-            selection.append(tag)
+    private func isSelected(_ tag: SoundTag) -> Bool {
+        selection.contains {
+            $0.name.localizedCaseInsensitiveCompare(tag.name) == .orderedSame &&
+            (tag.category != .language || $0.category == .language)
         }
+    }
+
+    private func toggle(_ tag: SoundTag) {
+        if isSelected(tag) {
+            selection.removeAll { $0.name.localizedCaseInsensitiveCompare(tag.name) == .orderedSame }
+            return
+        }
+        if tag.category == .language {
+            selection.removeAll { $0.category == .language || $0.name.localizedCaseInsensitiveCompare(tag.name) == .orderedSame }
+            if let instrumental = selection.firstIndex(where: { $0.category == .voice && $0.name == "Instrumental" }),
+               let vocals = tagOptions.first(where: { $0.category == .voice && $0.name == "Vocals" }) {
+                selection[instrumental] = vocals
+            }
+        } else if tag.category == .voice {
+            selection.removeAll { $0.category == .voice || (tag.name == "Instrumental" && $0.category == .language) }
+        }
+        selection.append(tag)
     }
 }
