@@ -89,12 +89,15 @@ struct SavedSong: Identifiable, Codable {
     let style: String
     let lyrics: String
     let createdAt: Date
+    var semanticFilename: String?
 }
 
 private struct GeneratedTrack {
     let url: URL
     let request: MusicGenerationRequest
     var duration: TimeInterval = 0
+    var semanticTokens: [Int] = []
+    var continuesRadioSeed: UInt64?
 }
 
 struct CreationJob: Identifiable {
@@ -106,6 +109,7 @@ struct CreationJob: Identifiable {
     let renderer: CreateRenderer
     let length: CreateLength
     let acoustics: CreateAcoustics
+    let reference: MusicReference?
     var title: String { idea.split(whereSeparator: \.isWhitespace).prefix(6).joined(separator: " ") }
 }
 
@@ -278,7 +282,7 @@ private final class PreviewPlayback {
             return available >= reserve
         }
         // Whole-song synthesis is already complete when these PCM tiles arrive.
-        if acoustics == .reference { return available >= 7.5 }
+        if acoustics != .streaming { return available >= 7.5 }
         let minimum = hasStarted ? 28.0 : 24.0
         let additional = min(18, max(0, (renderRate - 1) * 60))
         return available >= minimum + additional
@@ -329,6 +333,8 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
     private(set) var savedSongs: [SavedSong] = []
     private var currentTrack: GeneratedTrack?
     private var radioQueue: [GeneratedTrack] = []
+    private var preparedRadioSeed: UInt64?
+    private var radioReserve: GeneratedTrack?
     private let radioQueueCapacity = 2
     private var currentSavedID: UUID?
     private(set) var radioMode = true
@@ -337,6 +343,9 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
     private var replaceWhenReady = false
     private var isEditingRadio = false
     private var radioTrackEnded = false
+    private var radioCanRetry = true
+    private var radioContinuation: (seed: UInt64, prefix: [Int], minimumFrames: Int, lyrics: String)?
+    var remixSource: MusicReference?
     private var fadingPlayer: AVAudioPlayer?
     private var fadeTask: Task<Void, Never>?
     var selectedID: UUID?
@@ -369,6 +378,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
     var canGenerate: Bool { generationBackend.isAvailable }
     var canUsePairedMetal: Bool { generationBackend.canUsePairedMetal }
     var canStreamAcoustics: Bool { generationBackend.canStreamAcoustics }
+    var canFastFullSong: Bool { generationBackend.canFastFullSong }
     func prepareEarlyPlayback() { generationBackend.prepareEarlyPlayback() }
     var canCreateExtended: Bool { generationBackend.canCreateExtended }
     var radioReadyCount: Int { radioQueue.count }
@@ -491,7 +501,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         let previous = selected.musicProfile
         update(&vibes[selectedIndex]); persist(); updateNowPlaying()
         if selected.musicProfile != previous {
-            resetRadioQueue()
+            resetRadioQueue(continueCurrentSong: true)
             isEditingRadio = false
             scheduleRadioUpdate()
         }
@@ -511,19 +521,29 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
     }
     private func radioControlChanged(_ changed: Bool, commit: Bool) {
         guard changed || (commit && isEditingRadio) else { return }
-        if !isEditingRadio { resetRadioQueue() }
+        if !isEditingRadio { resetRadioQueue(continueCurrentSong: true) }
         isEditingRadio = !commit
         if commit {
             persist()
             scheduleRadioUpdate()
         }
     }
-    private func resetRadioQueue() {
+    private func resetRadioQueue(continueCurrentSong: Bool = false) {
         if isCreating { creationAutoplay = false } else { cancelGeneration() }
-        discardRadioQueue()
+        let keepReserve = continueCurrentSong && isPlaying && currentTrack?.request.purpose == .radio
+        discardRadioQueue(keepingReserve: keepReserve)
         radioMode = true
         radioWantsPlayback = canGenerate && (isPlaying || radioWantsPlayback)
         replaceWhenReady = true
+        radioCanRetry = true
+        radioContinuation = nil
+        if continueCurrentSong, let track = currentTrack, isPlaying, track.request.purpose == .radio {
+            let count = min(track.semanticTokens.count - 250, max(50, Int(elapsed * 25)))
+            if count >= 50 {
+                radioContinuation = (track.request.seed, Array(track.semanticTokens.prefix(count)),
+                                     track.semanticTokens.count, track.request.lyrics)
+            }
+        }
     }
     func persist() {
         if let data = try? JSONEncoder().encode(vibes) { UserDefaults.standard.set(data, forKey: defaultsKey) }
@@ -542,13 +562,14 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
     func generateSong(
         idea: String = "", instrumental: Bool? = nil, preparedLyrics: String? = nil,
         createStyles: String? = nil, createRenderer: CreateRenderer = .metal, createLength: CreateLength = .automatic,
-        acoustics: CreateAcoustics = .reference
+        acoustics: CreateAcoustics = .reference, reference: MusicReference? = nil
     ) {
         if let createStyles {
             guard canGenerate else { errorMessage = MusicGenerationError.metalUnavailable.errorDescription; return }
             queuedCreations.append(CreationJob(idea: idea, styles: createStyles, lyrics: preparedLyrics,
                                                instrumental: instrumental ?? false, renderer: createRenderer,
-                                               length: createLength, acoustics: acoustics))
+                                               length: createLength, acoustics: reference == nil ? acoustics : .reference,
+                                               reference: reference))
             if !isCreating {
                 cancelGeneration()
                 errorMessage = nil
@@ -588,7 +609,9 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         activeCreation = job
         creationAutoplay = isPrompted && autoplay
         let voiceOverride: MusicGenerationRequest.Voice? = instrumental.map { $0 ? .instrumental : .vocals }
-        let seed = UInt64.random(in: 0...UInt64(Int64.max))
+        let reservedSeed = isPrompted ? nil : preparedRadioSeed
+        if !isPrompted { preparedRadioSeed = nil }
+        let seed = reservedSeed ?? UInt64.random(in: 0...UInt64(Int64.max))
         let radioProfile = selected.musicProfile
         var request = createStyles.map { MusicPromptBuilder().makeCreateRequest(idea: idea, styles: $0, instrumental: instrumental ?? false, seed: seed, length: createLength) }
             ?? MusicPromptBuilder().makeRadioPlaybackRequest(profile: radioProfile, seed: seed, idea: idea, voiceOverride: voiceOverride)
@@ -596,6 +619,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
             request.createRenderer = createLength == .extended ? .metal : job?.renderer ?? .metal
             request.createAcoustics = job?.acoustics ?? .reference
         }
+        let continuation = isPrompted ? nil : radioContinuation
         if request.voice == .vocals, let preparedLyrics, !preparedLyrics.isEmpty { request = request.withLyrics(preparedLyrics) }
         let id = UUID()
         let title = idea.split(whereSeparator: \.isWhitespace).prefix(6).joined(separator: " ")
@@ -645,6 +669,9 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
                     try Task.checkCancellation()
                     guard self?.generationID == id else { return }
                 }
+                if let continuation, prepared.voice != .instrumental, prepared.lyrics.isEmpty {
+                    prepared = prepared.withLyrics(continuation.lyrics)
+                }
                 if prepared.voice == .vocals && prepared.lyrics.isEmpty {
                     self?.isWritingLyrics = true
                     self?.creationStatus = "Writing lyrics…"
@@ -660,6 +687,12 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
                     guard self?.generationID == id else { return }
                     self?.isWritingLyrics = false
                 }
+                if let reference = job?.reference {
+                    prepared.semanticPrefix = reference.prefix
+                } else if let continuation {
+                    prepared.semanticPrefix = continuation.prefix
+                    prepared.minimumSemanticFrames = max(prepared.minimumSemanticFrames, continuation.minimumFrames)
+                }
                 if let usage = try await generationBackend.promptUsage(for: prepared), usage.count > usage.limit {
                     if isPrompted { self?.creationStatus = "Revising the prompt to fit…" }
                     prepared = try await Self.fitMusicPrompt(prepared, usage: usage,
@@ -671,7 +704,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
                 self?.creationStatus = "Preparing the music model…"
                 if !isPrompted { self?.radioRenderStage = .preparing }
                 let acoustics = prepared.createAcoustics
-                let streamsAudio = isPrompted && self?.creationAutoplay == true
+                let streamsAudio = isPrompted && self?.creationAutoplay == true && job?.reference?.originalAudio == nil
                 let stream = streamsAudio ? AsyncStream.makeStream(of: MusicAudioPreview.self) : nil
                 let previewTask = stream.map { stream in
                     Task { @MainActor [weak self] in
@@ -684,7 +717,12 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
                 let onPreview: (@Sendable (MusicAudioPreview) -> Void)?
                 if let stream { onPreview = { preview in stream.continuation.yield(preview) } }
                 else { onPreview = nil }
-                let url = try await generationBackend.generate(prepared, onPreview: onPreview) { [weak self] progress in
+                if !isPrompted, continuation == nil, reservedSeed == nil, prepared.voice == .instrumental,
+                   prepared.semanticPrefix.isEmpty, generationBackend.canPrepareRadioPair,
+                   self?.canComposeRadioPairAhead == true {
+                    prepared.radioSuccessorSeed = Self.newRadioSeed(excluding: prepared.seed)
+                }
+                let output = try await generationBackend.generate(prepared, onPreview: onPreview) { [weak self] progress in
                     Task { @MainActor in
                         guard let self, self.generationID == id else { return }
                         let fraction: Double
@@ -699,29 +737,41 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
                             else { self.radioRenderStage = .rendering(step: step, total: total) }
                         case .waveform:
                             fraction = 0.96
-                            if isPrompted { self.creationStatus = acoustics == .reference ? "Decoding audio…" : "Finishing audio…" }
+                            if isPrompted { self.creationStatus = acoustics == .streaming ? "Finishing audio…" : "Decoding audio…" }
                             else { self.radioRenderStage = .finishing }
                         }
                         self.generationProgress = max(self.generationProgress, fraction)
                     }
                 }
+                let url = output.url
                 resultURL = url
                 stream?.continuation.finish()
                 await previewTask?.value
                 try Task.checkCancellation()
                 guard let self, self.generationID == id else { try? FileManager.default.removeItem(at: url); return }
                 let length = isPrompted ? 0 : try AVAudioPlayer(contentsOf: url).duration
-                let track = GeneratedTrack(url: url, request: prepared, duration: length)
+                if let reference = job?.reference, let original = reference.originalAudio {
+                    self.creationStatus = "Blending the original opening…"
+                    try await Self.preserveOpening(from: original, in: url, prefix: reference.prefix, result: output.semanticTokens)
+                    try Task.checkCancellation()
+                    guard self.generationID == id else { try? FileManager.default.removeItem(at: url); return }
+                }
+                let track = GeneratedTrack(url: url, request: prepared, duration: length,
+                                           semanticTokens: output.semanticTokens, continuesRadioSeed: continuation?.seed)
                 if isPrompted {
                     let saved = try self.persistSong(track, title: title.isEmpty ? "Your song" : title)
                     self.lastCreatedSong = saved
-                    let completed = GeneratedTrack(url: self.songURL(saved), request: prepared)
+                    let completed = GeneratedTrack(url: self.songURL(saved), request: prepared, semanticTokens: output.semanticTokens)
                     if !self.completePreview(completed, savedID: saved.id, generation: id), self.creationAutoplay {
                         try self.startTrack(completed, savedID: saved.id, crossfade: self.isPlaying)
                     }
                     self.finishGeneration(id)
                     try? FileManager.default.removeItem(at: url)
                 } else {
+                    self.radioCanRetry = true
+                    self.preparedRadioSeed = output.radioSuccessorSeed
+                    self.radioContinuation = nil
+                    self.discardRadioReserve()
                     self.radioQueue.append(track)
                     self.finishGeneration(id)
                     if self.radioWantsPlayback && (!self.isPlaying || self.replaceWhenReady) {
@@ -744,6 +794,13 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
                 self.cancelPreview(generation: id)
                 self.finishGeneration(id)
                 if !isPrompted {
+                    #if os(macOS)
+                    if self.radioWantsPlayback, self.radioCanRetry {
+                        self.radioCanRetry = false
+                        self.scheduleRadioUpdate(after: .seconds(2))
+                        return
+                    }
+                    #endif
                     self.radioWantsPlayback = false
                     self.radioPreloading = false
                 }
@@ -779,6 +836,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         radioPreloading = false
         automaticGenerationTask?.cancel()
         automaticGenerationTask = nil
+        preparedRadioSeed = nil
         generationTask?.cancel()
         generationTask = nil
         generationID = nil
@@ -790,11 +848,11 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         radioRenderStage = .preparing
         creationStatus = ""
     }
-    private func scheduleRadioUpdate() {
+    private func scheduleRadioUpdate(after delay: Duration = .milliseconds(450)) {
         guard canGenerate else { return }
         automaticGenerationTask?.cancel()
         automaticGenerationTask = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(450)) }
+            do { try await Task.sleep(for: delay) }
             catch { return }
             guard !Task.isCancelled else { return }
             self?.automaticGenerationTask = nil
@@ -811,6 +869,17 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         if !isCreating { cancelGeneration() }
     }
 
+    private var canComposeRadioPairAhead: Bool {
+        // Cold stations already wait for two songs. Once on air, keep a reserve or ample lead.
+        if !isPlaying && currentTrack?.request.purpose != .radio { return true }
+        return !radioQueue.isEmpty || (isPlaying && duration - elapsed >= 140)
+    }
+
+    private static func newRadioSeed(excluding seed: UInt64) -> UInt64 {
+        let next = UInt64.random(in: 0...UInt64(Int64.max))
+        return next == seed ? next ^ 1 : next
+    }
+
     private func fillRadioQueue() {
         if radioQueue.count >= radioQueueCapacity {
             radioPreloading = false
@@ -823,6 +892,14 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
 
     private func advanceRadio(crossfade: Bool) {
         guard radioMode, radioWantsPlayback else { return }
+        #if os(macOS)
+        // Start a new station with one song in reserve. Replacements and underrun
+        // recovery can use the first ready song because playback is already underway.
+        if !isPlaying, currentTrack?.request.purpose != .radio, radioQueue.count < radioQueueCapacity {
+            fillRadioQueue()
+            return
+        }
+        #endif
         while !radioQueue.isEmpty {
             let track = radioQueue.removeFirst()
             do {
@@ -833,6 +910,18 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
             } catch {
                 try? FileManager.default.removeItem(at: track.url)
                 errorMessage = "Couldn't play the prepared song. Radio is preparing another."
+            }
+        }
+        // An edit can arrive just before the crossfade. Use the already rendered
+        // song if the replacement misses that deadline, then blend to it when ready.
+        if radioQueue.isEmpty, radioTrackEnded || (crossfade && duration - elapsed <= 2),
+           let reserve = radioReserve {
+            radioReserve = nil
+            do {
+                try startTrack(reserve, savedID: nil, crossfade: crossfade)
+                radioTrackEnded = false
+            } catch {
+                try? FileManager.default.removeItem(at: reserve.url)
             }
         }
         fillRadioQueue()
@@ -864,19 +953,100 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Songs", isDirectory: true).appendingPathComponent(song.filename)
     }
+
+    func remix(_ song: SavedSong) async throws {
+        let tokens: [Int]
+        let audio = songURL(song)
+        if let filename = song.semanticFilename,
+           let saved = try? await MusicReference.load(from: audio.deletingLastPathComponent().appendingPathComponent(filename)) {
+            tokens = saved.tokens
+        } else { tokens = try await MusicReference.load(from: audio).tokens }
+        try Task.checkCancellation()
+        remixSource = MusicReference(title: song.title, tokens: tokens, originalAudio: audio,
+                                     openingFrames: max(50, tokens.count / 2), sourceLyrics: song.lyrics)
+    }
+
+    @concurrent
+    private static func preserveOpening(from original: URL, in revised: URL, prefix: [Int], result: [Int]) async throws {
+        let applied = min(prefix.count, result.count - 250)
+        guard applied > 0, result.starts(with: prefix.prefix(applied)) else { throw MusicGenerationError.invalidReference }
+        let source = try AVAudioFile(forReading: original, commonFormat: .pcmFormatInt16, interleaved: true)
+        let generated = try AVAudioFile(forReading: revised, commonFormat: .pcmFormatInt16, interleaved: true)
+        guard source.processingFormat == generated.processingFormat, generated.processingFormat.sampleRate == 48_000 else {
+            throw MusicGenerationError.invalidReference
+        }
+        let blendStart = min(source.length, AVAudioFramePosition(applied * 1_920))
+        guard blendStart < generated.length else { throw MusicGenerationError.invalidReference }
+        let blendFrames = AVAudioFrameCount(min(24_000, source.length - blendStart, generated.length - blendStart))
+        let format = generated.processingFormat
+        let staging = revised.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: staging) }
+        do {
+            let output = try AVAudioFile(forWriting: staging, settings: format.settings, commonFormat: .pcmFormatInt16, interleaved: true)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48_000),
+                  let other = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 48_000),
+                  let src = buffer.int16ChannelData?[0], let dst = other.int16ChannelData?[0] else {
+                throw MusicGenerationError.invalidReference
+            }
+            func copy(_ file: AVAudioFile, until end: AVAudioFramePosition) throws {
+                while file.framePosition < end {
+                    try Task.checkCancellation()
+                    let frames = AVAudioFrameCount(min(48_000, end - file.framePosition))
+                    buffer.frameLength = frames
+                    try file.read(into: buffer, frameCount: frames)
+                    guard buffer.frameLength > 0 else { throw MusicGenerationError.invalidReference }
+                    try output.write(from: buffer)
+                }
+            }
+            try copy(source, until: blendStart)
+            generated.framePosition = blendStart
+            let channels = Int(format.channelCount)
+            var blended: AVAudioFrameCount = 0
+            while blended < blendFrames {
+                try Task.checkCancellation()
+                let remaining = blendFrames - blended
+                buffer.frameLength = remaining
+                other.frameLength = remaining
+                try source.read(into: buffer, frameCount: remaining)
+                try generated.read(into: other, frameCount: remaining)
+                let read = min(buffer.frameLength, other.frameLength)
+                guard read > 0 else { throw MusicGenerationError.invalidReference }
+                for frame in 0..<Int(read) {
+                    let mix = Float(Int(blended) + frame + 1) / Float(blendFrames)
+                    for channel in 0..<channels {
+                        let index = frame * channels + channel
+                        dst[index] = Int16(clamping: Int((Float(src[index]) * (1 - mix) + Float(dst[index]) * mix).rounded()))
+                    }
+                }
+                blended += read
+                let position = blendStart + AVAudioFramePosition(blended)
+                if source.framePosition != position { source.framePosition = position }
+                if generated.framePosition != position { generated.framePosition = position }
+                other.frameLength = read
+                try output.write(from: other)
+            }
+            try copy(generated, until: generated.length)
+        }
+        _ = try FileManager.default.replaceItemAt(revised, withItemAt: staging)
+    }
     private func persistSong(_ track: GeneratedTrack, title: String) throws -> SavedSong {
         let id = UUID()
         let item = SavedSong(id: id, title: title, filename: "\(id.uuidString).wav", style: track.request.style,
-                             lyrics: track.request.lyrics, createdAt: Date())
-        let destination = try libraryDirectory().appendingPathComponent(item.filename)
+                             lyrics: track.request.lyrics, createdAt: Date(),
+                             semanticFilename: track.semanticTokens.isEmpty ? nil : "\(id.uuidString).semantic.json")
+        let directory = try libraryDirectory()
+        let destination = directory.appendingPathComponent(item.filename)
+        let semanticURL = item.semanticFilename.map { directory.appendingPathComponent($0) }
         try FileManager.default.copyItem(at: track.url, to: destination)
         let updated = [item] + savedSongs
         do {
+            if let semanticURL { try JSONEncoder().encode(track.semanticTokens).write(to: semanticURL, options: .atomic) }
             let data = try JSONEncoder().encode(updated)
             UserDefaults.standard.set(data, forKey: "vibe-player-saved-songs")
             savedSongs = updated
         } catch {
             try? FileManager.default.removeItem(at: destination)
+            if let semanticURL { try? FileManager.default.removeItem(at: semanticURL) }
             throw error
         }
         return item
@@ -910,12 +1080,26 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         UserDefaults.standard.set(data, forKey: "vibe-player-saved-songs")
         savedSongs = remaining
         if lastCreatedSong?.id == song.id { lastCreatedSong = nil }
-        try? FileManager.default.removeItem(at: songURL(song))
+        let audio = songURL(song)
+        try? FileManager.default.removeItem(at: audio)
+        if let filename = song.semanticFilename {
+            try? FileManager.default.removeItem(at: audio.deletingLastPathComponent().appendingPathComponent(filename))
+        }
         if currentSavedID == song.id { currentSavedID = nil; liked = false }
     }
-    private func discardRadioQueue() {
+    private func discardRadioQueue(keepingReserve: Bool = false) {
+        preparedRadioSeed = nil
+        if keepingReserve, radioReserve == nil, !radioQueue.isEmpty {
+            radioReserve = radioQueue.removeFirst()
+        } else if !keepingReserve {
+            discardRadioReserve()
+        }
         for track in radioQueue { try? FileManager.default.removeItem(at: track.url) }
         radioQueue.removeAll()
+    }
+    private func discardRadioReserve() {
+        if let radioReserve { try? FileManager.default.removeItem(at: radioReserve.url) }
+        radioReserve = nil
     }
     private func discardCurrentTrack() {
         if let currentTrack, currentTrack.url.path.hasPrefix(FileManager.default.temporaryDirectory.path) {
@@ -1013,12 +1197,17 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
             #endif
         }
         next.volume = fadeDuration > 0 ? 0 : 1
+        if let seed = track.continuesRadioSeed, seed == oldTrack?.request.seed {
+            let split = Double(track.request.semanticPrefix.count) / 25
+            let position = previous?.currentTime ?? split
+            next.currentTime = max(split, position < next.duration - 3 ? position : split)
+        }
         guard next.play() else { throw MusicGenerationError.unavailable }
         stopPreview()
         clearTrackMetadata()
         audio = next; currentTrack = track; currentSavedID = savedID
         trackName = savedID == nil ? track.request.stationName : (savedSongs.first { $0.id == savedID }?.title ?? track.request.stationName)
-        isSample = false; isGenerated = true; duration = next.duration; elapsed = 0; isPlaying = true
+        isSample = false; isGenerated = true; duration = next.duration; elapsed = next.currentTime; isPlaying = true
         liked = savedID != nil; disliked = false
         startTimer(); updateNowPlaying()
         if fadeDuration > 0, let previous {
@@ -1119,6 +1308,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         }
         if radioMode, canGenerate {
             radioWantsPlayback = true
+            radioCanRetry = true
             if replaceWhenReady || radioTrackEnded || currentTrack?.request.purpose != .radio {
                 advanceRadio(crossfade: isPlaying)
                 return
@@ -1186,7 +1376,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         }
         guard let audio, isPlaying else { return }
         elapsed = audio.currentTime
-        if radioMode, radioWantsPlayback, !radioQueue.isEmpty, duration - elapsed <= 2.0 {
+        if radioMode, radioWantsPlayback, !radioQueue.isEmpty || radioReserve != nil, duration - elapsed <= 2.0 {
             advanceRadio(crossfade: true)
             return
         }

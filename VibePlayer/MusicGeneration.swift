@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import AVFoundation
+#endif
 
 /// A snapshot of the controls, independent of the player UI and the model runtime.
 struct MusicProfile: Equatable, Sendable {
@@ -18,18 +21,30 @@ enum CreateRenderer: Sendable {
 }
 
 enum CreateLength: String, Sendable {
-    case automatic, extended
+    case automatic, fullSong, extended
 
     var maximumFrames: Int { self == .extended ? 6_400 : 5_200 }
-    var minimumFrames: Int { self == .extended ? 5_250 : 200 }
+    var minimumFrames: Int {
+        switch self {
+        case .automatic: 200
+        case .fullSong: 3_000
+        case .extended: 5_250
+        }
+    }
 }
 
 enum CreateAcoustics: String, Sendable {
-    case streaming, reference
+    case streaming, reference, fastFullSong
 
-    static func resolve(preference: String, instrumental: Bool, supportsEarlyPlayback: Bool) -> Self {
+    static func resolve(preference: String, instrumental: Bool, supportsEarlyPlayback: Bool,
+                        supportsFastFullSong: Bool = false) -> Self {
+        if preference == Self.fastFullSong.rawValue { return supportsFastFullSong ? .fastFullSong : .reference }
         guard supportsEarlyPlayback else { return .reference }
+        #if os(macOS)
+        return Self(rawValue: preference) ?? .reference
+        #else
         return Self(rawValue: preference) ?? (instrumental ? .streaming : .reference)
+        #endif
     }
 }
 
@@ -49,6 +64,8 @@ struct MusicGenerationRequest: Equatable, Sendable {
     var createRenderer: CreateRenderer = .metal
     var minimumSemanticFrames = 200
     var createAcoustics: CreateAcoustics = .reference
+    var semanticPrefix: [Int] = []
+    var radioSuccessorSeed: UInt64?
 
     func withLyrics(_ lyrics: String) -> MusicGenerationRequest {
         var request = self
@@ -65,6 +82,7 @@ struct MusicPromptBuilder {
         var parts = [instrumental ? "instrumental" : "vocal music"]
         let cleanStyles = styles.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanIdea = idea.trimmingCharacters(in: .whitespacesAndNewlines)
+        if length == .fullSong { parts.append("full arrangement with a closing section") }
         if length == .extended { parts.append("extended arrangement with a closing section") }
         if !cleanStyles.isEmpty { parts.append("styles: " + cleanStyles) }
         if !cleanIdea.isEmpty { parts.append("song idea: " + cleanIdea) }
@@ -117,9 +135,16 @@ struct MusicPromptBuilder {
 
     func makeRadioPlaybackRequest(profile: MusicProfile, seed: UInt64, idea: String,
                                   voiceOverride: MusicGenerationRequest.Voice?) -> MusicGenerationRequest {
+        #if os(macOS)
+        var request = makeRequest(profile: profile, seed: seed, maxSemanticFrames: CreateLength.fullSong.maximumFrames,
+                                  idea: idea, voiceOverride: voiceOverride)
+        request.minimumSemanticFrames = CreateLength.fullSong.minimumFrames
+        request.style += "; full arrangement with a closing section"
+        #else
         var request = makeRequest(profile: profile, seed: seed, maxSemanticFrames: 4_200,
                                   idea: idea, voiceOverride: voiceOverride)
         request.minimumSemanticFrames = 2_000
+        #endif
         return request
     }
 }
@@ -131,12 +156,180 @@ protocol MusicGenerationBackend {
     var isAvailable: Bool { get }
     var canUsePairedMetal: Bool { get }
     var canStreamAcoustics: Bool { get }
+    var canFastFullSong: Bool { get }
     var canCreateExtended: Bool { get }
+    var canPrepareRadioPair: Bool { get }
     func prepareEarlyPlayback()
     func waitForIdle() async throws
     func promptUsage(for request: MusicGenerationRequest) async throws -> MusicPromptUsage?
     func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> URL
+                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput
+}
+
+struct MusicGenerationOutput {
+    let url: URL
+    var semanticTokens: [Int] = []
+    var radioSuccessorSeed: UInt64?
+}
+
+struct MusicReference: Equatable, Sendable {
+    let title: String
+    let tokens: [Int]
+    let originalAudio: URL?
+    var openingFrames: Int
+    var sourceLyrics: String?
+
+    var prefix: [Int] { Array(tokens.prefix(openingFrames)) }
+
+    static var canEncodeAudio: Bool {
+        #if os(macOS)
+        let files = referenceEncoder
+        return FileManager.default.isExecutableFile(atPath: files.executable.path)
+            && FileManager.default.isReadableFile(atPath: files.model.path)
+            && FileManager.default.isReadableFile(atPath: files.encoder.path)
+        #else
+        return false
+        #endif
+    }
+
+    @concurrent
+    static func load(from url: URL) async throws -> Self {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let ext = url.pathExtension.lowercased()
+        let tokens: [Int]
+        if ["csv", "txt", "json"].contains(ext) {
+            tokens = try readCodes(url)
+        } else {
+            #if os(macOS)
+            tokens = try await encodeAudio(url)
+            #else
+            throw MusicGenerationError.referenceEncoderUnavailable
+            #endif
+        }
+        return Self(title: url.deletingPathExtension().lastPathComponent, tokens: tokens,
+                    originalAudio: nil, openingFrames: min(750, tokens.count))
+    }
+
+    private static func readCodes(_ url: URL) throws -> [Int] {
+        guard let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              (1...262_144).contains(size) else { throw MusicGenerationError.invalidReference }
+        let data = try Data(contentsOf: url)
+        let tokens: [Int]
+        if url.pathExtension.lowercased() == "json" {
+            tokens = (try? JSONDecoder().decode([Int].self, from: data)) ?? []
+        } else {
+            let fields = String(decoding: data, as: UTF8.self).split { $0 == "," || $0.isWhitespace }
+            tokens = fields.compactMap { Int($0) }
+            guard tokens.count == fields.count else { throw MusicGenerationError.invalidReference }
+        }
+        guard (50...15_000).contains(tokens.count), tokens.allSatisfy({ (0..<32_768).contains($0) }) else {
+            throw MusicGenerationError.invalidReference
+        }
+        return tokens
+    }
+
+    #if os(macOS)
+    private static var referenceEncoder: (executable: URL, model: URL, encoder: URL) {
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("YuE2NativeAssets/Reference")
+        return (root.appendingPathComponent("yue-tokenize"),
+                root.appendingPathComponent("yue2-mothersuperior-realaudio-tokenizer-v4-Q8_0.gguf"),
+                root.appendingPathComponent("MERT-v2-FullSong-Q8_0.gguf"))
+    }
+
+    private static func encodeAudio(_ url: URL) async throws -> [Int] {
+        guard canEncodeAudio else { throw MusicGenerationError.referenceEncoderUnavailable }
+        let files = referenceEncoder
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vibe-reference-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clip = directory.appendingPathComponent("reference.wav")
+        let codes = directory.appendingPathComponent("codes.csv")
+        do {
+            let source = try AVAudioFile(forReading: url, commonFormat: .pcmFormatInt16, interleaved: true)
+            let format = source.processingFormat
+            guard (1...2).contains(format.channelCount), format.sampleRate > 0,
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_768) else {
+                throw MusicGenerationError.invalidReference
+            }
+            let limit = min(source.length, AVAudioFramePosition(format.sampleRate * 60))
+            let output = try AVAudioFile(forWriting: clip, settings: format.settings, commonFormat: .pcmFormatInt16, interleaved: true)
+            while source.framePosition < limit {
+                try Task.checkCancellation()
+                try source.read(into: buffer, frameCount: AVAudioFrameCount(min(32_768, limit - source.framePosition)))
+                guard buffer.frameLength > 0 else { throw MusicGenerationError.invalidReference }
+                try output.write(from: buffer)
+            }
+        }
+        let process = Process()
+        process.executableURL = files.executable
+        process.arguments = ["--model", files.model.path, "--audio", clip.path, "--out", codes.path, "--device", "MTL0"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        defer { if process.isRunning { process.terminate() } }
+        let deadline = ContinuousClock.now + .seconds(90)
+        while process.isRunning {
+            guard ContinuousClock.now < deadline else { throw MusicGenerationError.invalidReference }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        guard process.terminationStatus == 0 else { throw MusicGenerationError.invalidReference }
+        return try readCodes(codes)
+    }
+    #endif
+}
+
+struct AppleMusicQuery: Identifiable, Sendable {
+    let term: String
+    let artistOnly: Bool
+    var id: String { term }
+
+    static func parse(_ prompt: String) -> Self? {
+        let request = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "?.!"))
+        let lead = /(?i)^(?:please\s+)?(?:i want|i would like|i'd like|play|find|give me|listen to)\s+/
+        let body = request.replacing(lead, with: "")
+        let artist = /(?i)^(?:a\s+|an\s+|some\s+)?(?:song|track|music)\s+(?:by|from)\s+(.+)$/
+        if let match = body.wholeMatch(of: artist) { return Self(term: String(match.1), artistOnly: true) }
+        let namedArtist = /^(?:(?i:a|an|some)\s+)?([\p{Lu}][\p{L}'’.-]*(?:\s+[\p{Lu}][\p{L}'’.-]*){0,4})\s+(?i:song|track|music)$/
+        if let match = body.wholeMatch(of: namedArtist), request != body || match.1.contains(where: \.isWhitespace) {
+            return Self(term: String(match.1), artistOnly: true)
+        }
+        if request != body, let match = body.wholeMatch(of: /^(.+)\s+(?i:by)\s+(.+)$/) {
+            return Self(term: "\(match.1) \(match.2)", artistOnly: false)
+        }
+        return nil
+    }
+
+    struct Track: Decodable, Identifiable {
+        let trackId: Int
+        let trackName: String
+        let artistName: String
+        let trackViewUrl: URL
+        var id: Int { trackId }
+    }
+
+    @concurrent
+    func tracks() async throws -> [Track] {
+        struct Response: Decodable { let results: [Track] }
+        var query = URLComponents(string: "https://itunes.apple.com/search")!
+        query.queryItems = [URLQueryItem(name: "term", value: term), URLQueryItem(name: "entity", value: "song"),
+                            URLQueryItem(name: "limit", value: "12"),
+                            URLQueryItem(name: "country", value: Locale.current.region?.identifier ?? "US")]
+        if artistOnly { query.queryItems?.append(URLQueryItem(name: "attribute", value: "artistTerm")) }
+        let (data, response) = try await URLSession.shared.data(from: query.url!)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { return [] }
+        let results = try JSONDecoder().decode(Response.self, from: data).results
+        return results.filter { $0.trackViewUrl.scheme == "https" && $0.trackViewUrl.host == "music.apple.com" }
+            .filter { !artistOnly || $0.artistName.compare(term, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
+    }
+
+    var catalogURL: URL? {
+        var query = URLComponents(string: "https://music.apple.com/search")
+        query?.queryItems = [URLQueryItem(name: "term", value: term)]
+        return query?.url
+    }
 }
 
 struct MusicAudioPreview: Sendable {
@@ -158,8 +351,10 @@ enum MusicGenerationProgress: Sendable {
 }
 
 extension MusicGenerationBackend {
+    var canPrepareRadioPair: Bool { false }
     var canUsePairedMetal: Bool { false }
     var canStreamAcoustics: Bool { false }
+    var canFastFullSong: Bool { false }
     var canCreateExtended: Bool { false }
     func prepareEarlyPlayback() {}
     func waitForIdle() async throws {}
@@ -169,18 +364,21 @@ extension MusicGenerationBackend {
 struct UnavailableMusicGenerationBackend: MusicGenerationBackend {
     let isAvailable = false
     func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> URL {
+                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
         throw MusicGenerationError.metalUnavailable
     }
 }
 
 enum MusicGenerationError: LocalizedError {
-    case unavailable, metalUnavailable, extendedUnavailable, promptTooLong(count: Int, limit: Int)
+    case unavailable, metalUnavailable, extendedUnavailable, fastFullSongUnavailable, invalidReference, referenceEncoderUnavailable, promptTooLong(count: Int, limit: Int)
     var errorDescription: String? {
         switch self {
         case .unavailable: "Song generation isn't available yet."
         case .metalUnavailable: "The Metal music model is unavailable on this device."
         case .extendedUnavailable: "Extended songs require the 4:16 Metal model. Select Automatic length to use the installed model."
+        case .fastFullSongUnavailable: "Fast Full Song couldn't load its Mac audio runtime. Choose High Quality to render with the standard runtime."
+        case .invalidReference: "Couldn't use this opening. Choose a valid YuE2 reference or a generated song with an available audio file."
+        case .referenceEncoderUnavailable: "Import YuE2 semantic codes, or use a Mac with the Reference Audio model installed to import a recording."
         case .promptTooLong(let count, let limit): "The description and lyrics use \(count) tokens. The music model can use \(limit). Shorten the description or reduce the lyrics, then create again."
         }
     }

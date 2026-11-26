@@ -62,6 +62,8 @@ python Scripts/index_metal_weights.py /path/to/YuE2MetalAssets
 
 The index describes the compiled bundle’s packed Q4 weights. Generate it from the exact bundle you will ship. Select this decoder with `YuE2Renderer(assets: modelDirectory, execution: .metal)` or the CLI’s `--metal` flag. To compare compute backends with matching model weights and conditioning, use `.embedded` with the same version 3 bundle and the same prompt and seed. Small numeric differences during token sampling can produce different takes. Both backends use the same full-context acoustic model.
 
+On M3 Max, the standard Metal decoder schedules eight projection rows per threadgroup and unrolls its Q4 and attention loops. In a matched 3,200-token test, composition took 31.4 seconds with this tuning and 37.8 seconds with the original shader. Both runs produced the same tokens.
+
 To add the optional paired layout, prepare the sidecar from that same indexed bundle:
 
 ```sh
@@ -91,3 +93,5 @@ swift test
 ```
 
 The Mac CLI defaults to isolated mode. Pass `--embedded` for in-process generation. It prints a JSON result on stdout and progress on stderr. The result includes the token count, whether generation ended naturally, and measured token-stage, acoustic, and waveform times.
+
+On M3 Max Macs with at least 32 GiB of unified memory, `composePair` can share each Q4 weight read across two songs. Each song retains its own attention cache, sampling seed, and ending. Repeated Mac prompts reuse their read-only prefill output while each new song receives a fresh decoding cache.

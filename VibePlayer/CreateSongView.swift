@@ -17,6 +17,7 @@ struct CreateSongView: View {
     @State private var lyrics = ""
     @State private var instrumental = false
     @AppStorage("vibe-create-acoustics") private var preferredAcoustics = ""
+    @AppStorage("vibe-create-length") private var preferredLength = ""
     @State private var saved = false
     @State private var showSongwritingSettings = false
     @State private var showStyles = false
@@ -26,18 +27,48 @@ struct CreateSongView: View {
     @State private var sampleURL: URL?
     @State private var samplePlayer: AVAudioPlayer?
     @State private var sampleName: String?
+    @State private var referenceTask: Task<Void, Never>?
+    @State private var catalog: AppleMusicQuery?
     @State private var polishingPrompt = false
     @State private var promptPolishTask: Task<Void, Never>?
     @State private var promptError: String?
     @FocusState private var promptFocused: Bool
 
     private let accent = Color(red: 0.85, green: 0.79, blue: 1)
-    private var canCreate: Bool { !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    private var canSubmit: Bool { player.canGenerate && canCreate && !polishingPrompt }
+    private var hasPrompt: Bool { !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var catalogQuery: AppleMusicQuery? {
+        guard player.remixSource == nil, sampleName == nil, styles.isEmpty, lyrics.isEmpty, !instrumental else { return nil }
+        return AppleMusicQuery.parse(prompt)
+    }
+    private var canCreate: Bool { hasPrompt || player.remixSource != nil }
+    private var canSubmit: Bool {
+        catalogQuery != nil || (player.canGenerate && canCreate && !polishingPrompt && referenceTask == nil &&
+                               (sampleName == nil || player.remixSource != nil))
+    }
     private var showsPlayback: Bool { player.isPlaying || player.isGenerated || !player.isSample || player.isWaitingForRadio }
     private var acoustics: CreateAcoustics {
-        CreateAcoustics.resolve(preference: preferredAcoustics, instrumental: instrumental,
-                                supportsEarlyPlayback: player.canStreamAcoustics)
+        if player.remixSource != nil { return .reference }
+        return CreateAcoustics.resolve(preference: preferredAcoustics, instrumental: instrumental,
+                                       supportsEarlyPlayback: player.canStreamAcoustics,
+                                       supportsFastFullSong: player.canFastFullSong)
+    }
+    private var length: CreateLength {
+        if let preferred = CreateLength(rawValue: preferredLength), preferred != .extended || player.canCreateExtended {
+            return preferred
+        }
+        #if os(macOS)
+        return .fullSong
+        #else
+        return .automatic
+        #endif
+    }
+
+    private var maximumReferenceFrames: Int {
+        #if os(iOS)
+        return min(length.maximumFrames, 4_200) - 250
+        #else
+        return length.maximumFrames - 250
+        #endif
     }
 
     var body: some View {
@@ -81,15 +112,28 @@ struct CreateSongView: View {
         #else
         .fullScreenCover(isPresented: $showGeneration) { generationDetail }
         #endif
-        .fileImporter(isPresented: $showSamplePicker, allowedContentTypes: [.audio]) { result in
+        .sheet(item: $catalog) { query in
+            AppleMusicResults(query: query, createOriginal: player.canGenerate ? {
+                catalog = nil
+                enqueue()
+            } : nil)
+        }
+        .fileImporter(isPresented: $showSamplePicker,
+                      allowedContentTypes: (MusicReference.canEncodeAudio ? [.audio] : []) + [.json, .commaSeparatedText, .plainText]) { result in
             switch result {
-            case .success(let url): loadSample(url)
-            case .failure: player.errorMessage = "Couldn't open that sample. Try another audio file."
+            case .success(let url): loadReference(url)
+            case .failure: player.errorMessage = "Couldn't open that reference."
             }
         }
         .onChange(of: prompt) { if !prompt.isEmpty { saved = false } }
+        .onChange(of: player.remixSource?.originalAudio, initial: true) {
+            if let originalLyrics = player.remixSource?.sourceLyrics, !hasPrompt, lyrics.isEmpty {
+                lyrics = originalLyrics
+                instrumental = originalLyrics.isEmpty
+            }
+        }
         .alert("Polish prompt", isPresented: Binding(get: { promptError != nil }, set: { if !$0 { promptError = nil } })) { Button("OK", role: .cancel) { promptError = nil } } message: { Text(promptError ?? "") }
-        .onAppear { player.prepareEarlyPlayback() }
+        .onChange(of: acoustics, initial: true) { if acoustics == .streaming { player.prepareEarlyPlayback() } }
         .onDisappear { samplePlayer?.stop(); promptPolishTask?.cancel(); polishingPrompt = false }
     }
 
@@ -98,10 +142,18 @@ struct CreateSongView: View {
             Text("Create").font(.largeTitle.weight(.semibold)).accessibilityAddTraits(.isHeader)
             Spacer(minLength: 4)
             Menu {
-                if player.canStreamAcoustics {
+                if player.canStreamAcoustics || player.canFastFullSong {
                     Picker("Rendering", selection: Binding(get: { acoustics }, set: { preferredAcoustics = $0.rawValue })) {
-                        Text("Early playback").tag(CreateAcoustics.streaming)
+                        if player.canStreamAcoustics { Text("Early playback").tag(CreateAcoustics.streaming) }
+                        if player.canFastFullSong { Text("Fast Full Song").tag(CreateAcoustics.fastFullSong) }
                         Text("High quality").tag(CreateAcoustics.reference)
+                    }
+                }
+                Picker("Song length", selection: Binding(get: { length }, set: { preferredLength = $0.rawValue })) {
+                    Text("Automatic").tag(CreateLength.automatic)
+                    Text("Full song (2 min or more)").tag(CreateLength.fullSong)
+                    if player.canCreateExtended {
+                        Text("Extended (3½ min or more)").tag(CreateLength.extended)
                     }
                 }
                 Button("Save idea", systemImage: "bookmark") { saveIdea() }.disabled(!canCreate)
@@ -156,18 +208,30 @@ struct CreateSongView: View {
                     composerChip("Lyrics", symbol: "text.alignleft", selected: !lyrics.isEmpty || instrumental)
                 }.accessibilityIdentifier("edit-lyrics")
                 Button { promptFocused = false; showSamplePicker = true } label: {
-                    composerChip("Sample", symbol: "waveform", selected: sampleName != nil)
+                    composerChip("Reference", symbol: "waveform", selected: player.remixSource != nil || referenceTask != nil)
                 }.accessibilityIdentifier("add-sample")
             }.buttonStyle(.plain)
-            if let sampleName {
+            if let title = player.remixSource?.title ?? sampleName {
                 HStack(spacing: 7) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(sampleName).font(.subheadline.weight(.medium)).lineLimit(1)
-                        Text("Sample preview").font(.caption).foregroundStyle(.white.opacity(0.67))
+                        Text(title).font(.subheadline.weight(.medium)).lineLimit(1)
+                        if let reference = player.remixSource {
+                            let upper = max(50, min(reference.tokens.count, maximumReferenceFrames))
+                            let opening = Binding(get: { min(reference.openingFrames, upper) },
+                                                  set: { player.remixSource?.openingFrames = $0 })
+                            Stepper(value: opening, in: 50...upper, step: 25) {
+                                Text("\(reference.originalAudio != nil ? "Keep" : "Use") first \(opening.wrappedValue / 25) sec")
+                            }.font(.caption)
+                        } else {
+                            Text(referenceTask == nil ? "Reference unavailable" : "Listening to reference…")
+                                .font(.caption).foregroundStyle(.white.opacity(0.67))
+                        }
                     }
                     Spacer(minLength: 0)
-                    Button { playSample() } label: { Image(systemName: "play.fill").frame(width: 44, height: 44) }.accessibilityLabel("Play sample")
-                    Button { clearSample() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }.accessibilityLabel("Remove sample")
+                    if samplePlayer != nil {
+                        Button { playSample() } label: { Image(systemName: "play.fill").frame(width: 44, height: 44) }.accessibilityLabel("Play reference")
+                    }
+                    Button { clearSample() } label: { Image(systemName: "xmark").frame(width: 44, height: 44) }.accessibilityLabel("Remove reference")
                 }
                 .padding(.leading, 12).background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 13))
             }
@@ -219,7 +283,7 @@ struct CreateSongView: View {
                 if canCreate {
                     Button(action: submit) {
                         ViewThatFits(in: .horizontal) {
-                            Label("Queue", systemImage: "plus").font(.subheadline.weight(.semibold))
+                            Label(catalogQuery == nil ? "Queue" : "Find", systemImage: catalogQuery == nil ? "plus" : "music.note").font(.subheadline.weight(.semibold))
                                 .fixedSize().padding(.horizontal, 12)
                             Image(systemName: "plus").font(.body.weight(.bold)).frame(width: 44)
                         }.frame(height: 44).foregroundStyle(.black).background(accent, in: Capsule())
@@ -259,12 +323,13 @@ struct CreateSongView: View {
                         .frame(width: 44, height: 44).background(accent, in: Circle())
                         .opacity(canSubmit ? 1 : 0.34)
                 }
-                .disabled(!canSubmit).accessibilityLabel("Create").accessibilityIdentifier("create-song")
+                .disabled(!canSubmit).accessibilityLabel(catalogQuery == nil ? "Create" : "Find on Apple Music").accessibilityIdentifier("create-song")
             }.modifier(DockSurface(progress: player.duration > 0 ? player.elapsed / player.duration : 0, reduceMotion: reduceMotion))
                 .accessibilityElement(children: .contain).accessibilityIdentifier("create-dock")
         } else {
             Button(action: submit) {
-                Label("Create", systemImage: "waveform")
+                Label(catalogQuery == nil ? (player.remixSource == nil ? "Create" : "Remix") : "Find on Apple Music",
+                      systemImage: catalogQuery == nil ? "waveform" : "music.note")
                     .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 12).frame(minHeight: 52)
                     .foregroundStyle(canSubmit ? .black : .white.opacity(0.48))
                     .background(canSubmit ? accent : .white.opacity(0.08), in: RoundedRectangle(cornerRadius: 23))
@@ -390,9 +455,17 @@ struct CreateSongView: View {
 
     private func submit() {
         promptFocused = false
-        player.generateSong(idea: prompt.trimmingCharacters(in: .whitespacesAndNewlines), instrumental: instrumental,
+        if let catalogQuery { catalog = catalogQuery; return }
+        enqueue()
+    }
+
+    private func enqueue() {
+        var reference = player.remixSource
+        if let attached = reference { reference?.openingFrames = min(attached.openingFrames, maximumReferenceFrames) }
+        let idea = hasPrompt ? prompt.trimmingCharacters(in: .whitespacesAndNewlines) : "Remix \(reference?.title ?? "the reference")"
+        player.generateSong(idea: idea, instrumental: instrumental,
                             preparedLyrics: instrumental ? nil : lyrics.trimmingCharacters(in: .whitespacesAndNewlines),
-                            createStyles: styles, acoustics: acoustics)
+                            createStyles: styles, createLength: length, acoustics: acoustics, reference: reference)
         prompt = ""; styles = ""; lyrics = ""; instrumental = false; saved = false
         clearSample()
     }
@@ -424,6 +497,25 @@ struct CreateSongView: View {
             polishingPrompt = false
         }
     }
+    private func loadReference(_ url: URL) {
+        clearSample()
+        sampleName = url.deletingPathExtension().lastPathComponent
+        if !["csv", "txt", "json"].contains(url.pathExtension.lowercased()) { loadSample(url) }
+        referenceTask = Task {
+            do {
+                let reference = try await MusicReference.load(from: url)
+                try Task.checkCancellation()
+                player.remixSource = reference
+                if !hasPrompt && lyrics.isEmpty { instrumental = true }
+            } catch is CancellationError {
+                return
+            } catch {
+                if !Task.isCancelled { player.errorMessage = error.localizedDescription }
+            }
+            if !Task.isCancelled { referenceTask = nil }
+        }
+    }
+
     private func loadSample(_ source: URL) {
         let scoped = source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
@@ -431,7 +523,7 @@ struct CreateSongView: View {
         do {
             try FileManager.default.copyItem(at: source, to: target)
             let audio = try AVAudioPlayer(contentsOf: target)
-            clearSample(); sampleURL = target; samplePlayer = audio; sampleName = source.deletingPathExtension().lastPathComponent
+            sampleURL = target; samplePlayer = audio
         } catch {
             try? FileManager.default.removeItem(at: target)
             player.errorMessage = "Couldn't open that sample. Try another audio file."
@@ -443,9 +535,49 @@ struct CreateSongView: View {
         if !samplePlayer.play() { player.errorMessage = "Couldn't play that sample." }
     }
     private func clearSample() {
+        referenceTask?.cancel(); referenceTask = nil; player.remixSource = nil
         samplePlayer?.stop(); samplePlayer = nil
         if let sampleURL { try? FileManager.default.removeItem(at: sampleURL) }
         sampleURL = nil; sampleName = nil
+    }
+}
+
+private struct AppleMusicResults: View {
+    let query: AppleMusicQuery
+    let createOriginal: (() -> Void)?
+    @Environment(\.dismiss) private var dismiss
+    @State private var tracks: [AppleMusicQuery.Track]?
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let tracks {
+                    if tracks.isEmpty { Text("No matching tracks found in this storefront.").foregroundStyle(.secondary) }
+                    ForEach(tracks) { track in
+                        Link(destination: track.trackViewUrl) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(track.trackName).font(.headline)
+                                Text(track.artistName).font(.subheadline).foregroundStyle(.secondary)
+                            }.padding(.vertical, 5)
+                        }
+                    }
+                } else {
+                    ProgressView("Searching Apple Music…")
+                }
+                if let url = query.catalogURL {
+                    Link("Open '\(query.term)' in Apple Music", destination: url)
+                }
+                if let createOriginal {
+                    Button("Create an original song instead", action: createOriginal)
+                }
+            }
+            .navigationTitle("Apple Music")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .task { tracks = (try? await query.tracks()) ?? [] }
+        }
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 420)
+        #endif
     }
 }
 

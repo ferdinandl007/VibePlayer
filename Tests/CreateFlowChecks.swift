@@ -43,7 +43,7 @@ private final class TestRenderer: MusicGenerationBackend {
     }
 
     func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> URL {
+                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
         self.request = request
         receivedPreview = onPreview != nil
         onProgress(.tokens(50, 512))
@@ -52,15 +52,52 @@ private final class TestRenderer: MusicGenerationBackend {
     }
 }
 
+#if os(macOS)
+@MainActor
+private final class RadioTestRenderer: MusicGenerationBackend {
+    let isAvailable = true
+    let directory: URL
+    private(set) var requests: [MusicGenerationRequest] = []
+    var readyThrough = 2
+    var canPrepareRadioPair = false
+
+    init(directory: URL) { self.directory = directory }
+
+    func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
+                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
+        requests.append(request)
+        let index = requests.count
+        while index > readyThrough { try await Task.sleep(for: .milliseconds(10)) }
+        let url = directory.appendingPathComponent("\(index).wav")
+        let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 8_000, channels: 1, interleaved: true)!
+        let frames = AVAudioFrameCount((3 + index * 3) * 8_000)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buffer.frameLength = frames
+        buffer.int16ChannelData![0].update(repeating: 0, count: Int(frames))
+        let file = try AVAudioFile(forWriting: url, settings: format.settings,
+                                   commonFormat: .pcmFormatInt16, interleaved: true)
+        try file.write(from: buffer)
+        return MusicGenerationOutput(url: url, radioSuccessorSeed: request.radioSuccessorSeed)
+    }
+}
+#endif
+
 @main
 struct CreateFlowChecks {
     @MainActor static func main() async throws {
         try checkPreviewFadesAndDoesNotSkipFrames()
         precondition(CreateAcoustics.resolve(preference: "", instrumental: false, supportsEarlyPlayback: true) == .reference)
+        #if os(macOS)
+        precondition(CreateAcoustics.resolve(preference: "", instrumental: true, supportsEarlyPlayback: true) == .reference)
+        #else
         precondition(CreateAcoustics.resolve(preference: "", instrumental: true, supportsEarlyPlayback: true) == .streaming)
+        #endif
         precondition(CreateAcoustics.resolve(preference: "streaming", instrumental: false, supportsEarlyPlayback: true) == .streaming)
         precondition(CreateAcoustics.resolve(preference: "reference", instrumental: true, supportsEarlyPlayback: true) == .reference)
         precondition(CreateAcoustics.resolve(preference: "streaming", instrumental: false, supportsEarlyPlayback: false) == .reference)
+        precondition(CreateAcoustics.resolve(preference: "fastFullSong", instrumental: true, supportsEarlyPlayback: true) == .reference)
+        precondition(CreateAcoustics.resolve(preference: "fastFullSong", instrumental: true, supportsEarlyPlayback: false,
+                                             supportsFastFullSong: true) == .fastFullSong)
         let writer = TestWriter()
         let renderer = TestRenderer()
         let player = PlayerStore(generationBackend: renderer, lyricsWriter: writer)
@@ -94,14 +131,82 @@ struct CreateFlowChecks {
         precondition(renderer.request?.lyrics == "[Verse]\nKeep this line intact")
         precondition(player.creationNotice?.contains("revised a copy") == true)
         player.cancelGeneration()
+
+        renderer.needsRevision = false
+        let codes = Array(repeating: 901, count: 100)
+        let reference = MusicReference(title: "Existing take", tokens: codes, originalAudio: nil, openingFrames: 75)
+        player.generateSong(idea: "Take the outro acoustic", instrumental: true, createStyles: "jazz",
+                            acoustics: .streaming, reference: reference)
+        try await Task.sleep(for: .milliseconds(80))
+        precondition(renderer.request?.semanticPrefix == Array(codes.prefix(75)))
+        precondition(renderer.request?.createAcoustics == .reference)
+        player.cancelGeneration()
+
         renderer.isAvailable = false
         player.generateSong(idea: "A different song", instrumental: true, createStyles: "ambient")
         precondition(!player.isCreating && player.errorMessage == MusicGenerationError.metalUnavailable.errorDescription)
         player.errorMessage = nil
         player.generateSong()
         precondition(!player.isGenerating && player.errorMessage == MusicGenerationError.metalUnavailable.errorDescription)
+        #if os(macOS)
+        try await checkRadioKeepsPlayingAfterLateEdit()
+        try await checkRadioUsesPreparedSuccessor()
+        #endif
         print("Create flow checks passed")
     }
+
+    #if os(macOS)
+    @MainActor private static func checkRadioKeepsPlayingAfterLateEdit() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let renderer = RadioTestRenderer(directory: directory)
+        let player = PlayerStore(generationBackend: renderer, lyricsWriter: TestWriter())
+        let savedBefore = player.savedSongs.map(\.id)
+        defer { player.pause(); player.cancelRadioPreparation() }
+
+        func waitFor(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(4))
+            while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            if !condition() { throw TestError.failed }
+        }
+
+        player.play()
+        try await waitFor { player.isPlaying && renderer.requests.count == 3 }
+        precondition(player.duration == 6 && player.radioReadyCount == 1)
+
+        let tempo = player.selected.tempo == 60 ? 80.0 : 60.0
+        player.setTempo(tempo, commit: true)
+        player.seek(player.duration - 1)
+        try await waitFor { player.isPlaying && player.duration == 9 && renderer.requests.count == 4 }
+        precondition(renderer.requests.last?.style.contains("\(Int(tempo)) BPM") == true)
+
+        renderer.readyThrough = 4
+        try await waitFor { player.isPlaying && player.duration == 15 }
+        precondition(player.savedSongs.map(\.id) == savedBefore)
+    }
+    @MainActor private static func checkRadioUsesPreparedSuccessor() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let renderer = RadioTestRenderer(directory: directory)
+        renderer.canPrepareRadioPair = true
+        let player = PlayerStore(generationBackend: renderer, lyricsWriter: TestWriter())
+        player.vibes[player.selectedIndex].tags.removeAll { $0.category == .voice }
+        player.vibes[player.selectedIndex].tags.append(SoundTag(name: "Instrumental", symbol: "music.note", category: .voice))
+        defer { player.cancelRadioPreparation() }
+        player.prepareRadio()
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(4))
+        while player.radioReadyCount < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        precondition(player.radioReadyCount == 2 && renderer.requests.count == 2)
+        let first = renderer.requests[0], second = renderer.requests[1]
+        precondition(first.radioSuccessorSeed == second.seed && first.seed != second.seed)
+        precondition(second.radioSuccessorSeed == nil)
+    }
+    #endif
 
     @MainActor private static func checkPreviewFadesAndDoesNotSkipFrames() throws {
         let fade = PreviewPCM.fade

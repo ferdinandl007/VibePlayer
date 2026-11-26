@@ -24,6 +24,12 @@ public struct YuE2Audio: Sendable {
     public var duration: Double { Double(frameCount) / Double(sampleRate) }
 }
 
+public struct YuE2WaveformChunk: Sendable {
+    public let audio: YuE2Audio
+    public let startFrame: Int
+    public let totalFrames: Int
+}
+
 public enum YuE2Error: LocalizedError {
     case native(String)
     case invalidRequest
@@ -66,9 +72,41 @@ public actor YuE2Engine {
         let tokens: [Int]
     }
 
+    private final class WaveformObserver {
+        let onPCM: @Sendable (YuE2WaveformChunk) -> Void
+        let totalFrames: Int
+        let naturalEnding: Bool
+        var received = 0
+        var invalid = false
+
+        init(totalFrames: Int, naturalEnding: Bool, onPCM: @escaping @Sendable (YuE2WaveformChunk) -> Void) {
+            self.totalFrames = totalFrames
+            self.naturalEnding = naturalEnding
+            self.onPCM = onPCM
+        }
+
+        static let receive: yu_pcm_callback = { context, samples, frames, rate, channels, start, total in
+            guard let context else { return 1 }
+            let observer = Unmanaged<WaveformObserver>.fromOpaque(context).takeUnretainedValue()
+            guard !Task.isCancelled else { return 1 }
+            guard let samples, rate == 48_000, channels == 2, total == observer.totalFrames,
+                  start == observer.received, frames > 0, frames <= total - start else {
+                observer.invalid = true
+                return 1
+            }
+            let audio = YuE2Audio(samples: Array(UnsafeBufferPointer(start: samples, count: frames * 2)),
+                                  sampleRate: Int(rate), channels: Int(channels))
+            let output = observer.naturalEnding ? audio : YuE2Engine.fadeEnd(audio, startFrame: start, totalFrames: total)
+            observer.received += frames
+            observer.onPCM(YuE2WaveformChunk(audio: output, startFrame: start, totalFrames: total))
+            return 0
+        }
+    }
+
     private let session: Session
     private let mode: SynthesisMode
     private var generating = false
+    public nonisolated let supportsWaveformStreaming: Bool
 
     @concurrent
     public static func load(library: URL, weights: URL, modelSpec: URL? = nil,
@@ -90,28 +128,57 @@ public actor YuE2Engine {
         guard let handle else { throw YuE2Error.native(String(cString: yu_error())) }
         session = Session(handle)
         self.mode = mode
+        supportsWaveformStreaming = yu_supports_pcm(handle) != 0
     }
 
     /// Render a single take and let the model end it within the frame budget.
     public func render(_ prompt: YuE2Prompt, frames: Int, steps: Int = 8, minimumFrames: Int? = nil) throws -> YuE2Audio {
+        try renderTake(prompt, frames: frames, steps: steps, minimumFrames: minimumFrames).audio
+    }
+
+    /// Returns the take and the semantic codes that can condition a future remix.
+    public func renderTake(_ prompt: YuE2Prompt, frames: Int, steps: Int = 8, minimumFrames: Int? = nil,
+                           semanticPrefix: [Int] = []) throws -> (audio: YuE2Audio, tokens: [Int]) {
         guard !generating else { throw YuE2Error.busy }
         try validate(prompt, checkpoints: [frames], steps: steps)
         if let minimumFrames, !(25...frames).contains(minimumFrames) { throw YuE2Error.invalidRequest }
+        guard semanticPrefix.count < frames, semanticPrefix.allSatisfy({ (0..<32_768).contains($0) }) else {
+            throw YuE2Error.invalidContinuation
+        }
         let result = try render(prompt, frames: frames, steps: steps,
-                                minimumFrames: mode == .streamingPreview ? frames : minimumFrames, prefix: [])
-        guard result.tokens.count == frames else { return result.audio }
-        return Self.fadeEnd(result.audio)
+                                minimumFrames: mode == .streamingPreview ? frames : minimumFrames, prefix: semanticPrefix)
+        let audio = result.tokens.count == frames ? Self.fadeEnd(result.audio) : result.audio
+        return (audio, result.tokens)
+    }
+
+    /// Renders the complete song in one acoustic pass. With the PCM-enabled runtime,
+    /// `onPCM` receives finalized stereo waveform tiles while later tiles decode.
+    public func renderComposed(_ prompt: YuE2Prompt, tokens: [Int], naturalEnding: Bool, steps: Int = 8,
+                               onPCM: (@Sendable (YuE2WaveformChunk) -> Void)? = nil) throws -> YuE2Audio {
+        guard !generating else { throw YuE2Error.busy }
+        guard mode == .fullSong, tokens.allSatisfy({ (0..<32_768).contains($0) }) else {
+            throw YuE2Error.invalidRequest
+        }
+        try validate(prompt, checkpoints: [tokens.count], steps: steps)
+        let frames = tokens.count * 1_920 - 64
+        let observer = onPCM.map { WaveformObserver(totalFrames: frames, naturalEnding: naturalEnding, onPCM: $0) }
+        let result = try render(prompt, frames: tokens.count, steps: steps, minimumFrames: tokens.count,
+                                prefix: tokens, observer: observer)
+        guard result.audio.frameCount == frames, observer.map({ $0.received == frames }) ?? true else {
+            throw YuE2Error.invalidAudio
+        }
+        return naturalEnding ? result.audio : Self.fadeEnd(result.audio)
     }
 
     /// Delivers contiguous PCM as successive renders complete. Enqueue each chunk promptly.
     /// Stopping the task cancels before the next native render or delivery.
-    public func renderProgressively(
+    @discardableResult public func renderProgressively(
         _ prompt: YuE2Prompt,
         checkpoints: [Int]? = nil,
         steps: Int = 4,
         minimumFrames: Int? = nil,
         onAudio: @Sendable (YuE2Audio) async throws -> Void
-    ) async throws {
+    ) async throws -> [Int] {
         guard !generating else { throw YuE2Error.busy }
         let windowed = mode == .streamingPreview
         let checkpoints = checkpoints ?? (windowed ? Self.windowedPreviewCheckpoints : Self.previewCheckpoints)
@@ -143,9 +210,10 @@ public actor YuE2Engine {
                                        holdback: holdback, overlap: overlap, final: final)
             try Task.checkCancellation()
             try await onAudio(final && !ended ? Self.fadeEnd(chunk) : chunk)
-            if final { return }
+            if final { return current.tokens }
             previous = current
         }
+        throw YuE2Error.invalidRequest
     }
 
     private func validate(_ prompt: YuE2Prompt, checkpoints: [Int], steps: Int) throws {
@@ -157,7 +225,7 @@ public actor YuE2Engine {
     }
 
     private func render(_ prompt: YuE2Prompt, frames: Int, steps: Int,
-                        minimumFrames: Int?, prefix: [Int]) throws -> Render {
+                        minimumFrames: Int?, prefix: [Int], observer: WaveformObserver? = nil) throws -> Render {
         try Task.checkCancellation()
         let encoded = prefix.isEmpty ? nil : String(decoding: try JSONEncoder().encode(prefix), as: UTF8.self)
         let minimum = Int32(minimumFrames ?? 0)
@@ -165,13 +233,22 @@ public actor YuE2Engine {
             prompt.style.withCString { style in
                 if let encoded {
                     return encoded.withCString {
-                        yu_render(session.handle, lyrics, style, prompt.seed, Int32(frames), Int32(steps), minimum, $0)
+                        if let observer {
+                            return yu_render_observing_pcm(session.handle, lyrics, style, prompt.seed, Int32(frames),
+                                                           Int32(steps), minimum, $0, WaveformObserver.receive,
+                                                           Unmanaged.passUnretained(observer).toOpaque())
+                        }
+                        return yu_render(session.handle, lyrics, style, prompt.seed, Int32(frames), Int32(steps), minimum, $0)
                     }
                 }
                 return yu_render(session.handle, lyrics, style, prompt.seed, Int32(frames), Int32(steps), minimum, nil)
             }
         }
-        guard let result else { throw YuE2Error.native(String(cString: yu_error())) }
+        guard let result else {
+            if observer?.invalid == true { throw YuE2Error.invalidAudio }
+            try Task.checkCancellation()
+            throw YuE2Error.native(String(cString: yu_error()))
+        }
         defer { yu_result_close(result) }
         try Task.checkCancellation()
 
@@ -194,15 +271,18 @@ public actor YuE2Engine {
         return Render(audio: audio, tokens: tokens)
     }
 
-    private static func fadeEnd(_ audio: YuE2Audio) -> YuE2Audio {
-        let fadeFrames = min(audio.sampleRate * 3 / 2, audio.frameCount / 2)
-        guard fadeFrames > 1 else { return audio }
+    private static func fadeEnd(_ audio: YuE2Audio, startFrame: Int = 0, totalFrames: Int? = nil) -> YuE2Audio {
+        let total = totalFrames ?? audio.frameCount
+        let fadeFrames = min(audio.sampleRate * 3 / 2, total / 2)
+        let fadeStart = total - fadeFrames
+        let first = max(fadeStart, startFrame)
+        let end = startFrame + audio.frameCount
+        guard fadeFrames > 1, first < end else { return audio }
         var samples = audio.samples
-        let start = audio.frameCount - fadeFrames
-        for frame in start..<audio.frameCount {
-            let phase = Float(frame - start) / Float(fadeFrames - 1)
+        for frame in first..<end {
+            let phase = Float(frame - fadeStart) / Float(fadeFrames - 1)
             let gain = 0.5 + 0.5 * cos(.pi * phase)
-            for channel in 0..<audio.channels { samples[frame * audio.channels + channel] *= gain }
+            for channel in 0..<audio.channels { samples[(frame - startFrame) * audio.channels + channel] *= gain }
         }
         return YuE2Audio(samples: samples, sampleRate: audio.sampleRate, channels: audio.channels)
     }

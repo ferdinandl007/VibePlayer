@@ -46,10 +46,11 @@ func provider(_ inputs: [String: MLMultiArray]) throws -> MLDictionaryFeaturePro
     try MLDictionaryFeatureProvider(dictionary: inputs.mapValues { MLFeatureValue(multiArray: $0) })
 }
 
+let ropeFrequencies = (0 ..< 64).map { powf(1_000_000, -Float($0) / 64) }
+
 func rope(_ positions: [[Int]]) throws -> (MLMultiArray, MLMultiArray) {
     let columns = positions[0].count
     let shape = [positions.count, 1, columns, 64]
-    let frequencies = (0 ..< 64).map { powf(1_000_000, -Float($0) / 64) }
     let sine = try tensor(shape)
     let cosine = try tensor(shape)
     sine.withUnsafeMutableBufferPointer(ofType: Float16.self) { s, ss in
@@ -57,7 +58,7 @@ func rope(_ positions: [[Int]]) throws -> (MLMultiArray, MLMultiArray) {
             for (b, row) in positions.enumerated() {
                 for (t, pos) in row.enumerated() {
                     for i in 0 ..< 64 {
-                        let phase = Float(pos) * frequencies[i]
+                        let phase = Float(pos) * ropeFrequencies[i]
                         s[b * ss[0] + t * ss[2] + i * ss[3]] = Float16(sinf(phase))
                         c[b * cs[0] + t * cs[2] + i * cs[3]] = Float16(cosf(phase))
                     }
@@ -99,14 +100,15 @@ struct Embeddings {
 
 /// Copies active rows between FP16 cache views with independent strides and capacities.
 func copyCache(_ source: MLMultiArray, to target: MLMultiArray, lengths: [Int],
-               sourceStart: Int = 0, targetStart: Int = 0) throws {
+               sourceStart: Int = 0, targetStart: Int = 0, targetBatch: Int = 0) throws {
     let srcShape = source.shape.map(\.intValue)
     let dstShape = target.shape.map(\.intValue)
     let from = source.strides.map(\.intValue)
     guard srcShape.count == 5, dstShape.count == 5, from.count == 5, !lengths.isEmpty,
           source.dataType == .float16, target.dataType == .float16,
           srcShape[0] == dstShape[0], srcShape[2] == dstShape[2], srcShape[4] == dstShape[4],
-          lengths.count <= min(srcShape[1], dstShape[1]), sourceStart >= 0, targetStart >= 0,
+          targetBatch >= 0, targetBatch <= dstShape[1], lengths.count <= min(srcShape[1], dstShape[1] - targetBatch),
+          sourceStart >= 0, targetStart >= 0,
           lengths.allSatisfy({ $0 >= 0 && $0 <= min(srcShape[3] - sourceStart, dstShape[3] - targetStart) }) else {
         throw YuE2Failure.inference("Invalid active cache shape.")
     }
@@ -116,7 +118,7 @@ func copyCache(_ source: MLMultiArray, to target: MLMultiArray, lengths: [Int],
                 for b in lengths.indices where lengths[b] > 0 {
                     for h in 0..<dstShape[2] {
                         let s = l * from[0] + b * from[1] + h * from[2] + sourceStart * from[3]
-                        let d = l * to[0] + b * to[1] + h * to[2] + targetStart * to[3]
+                        let d = l * to[0] + (b + targetBatch) * to[1] + h * to[2] + targetStart * to[3]
                         if from[4] == 1, to[4] == 1, from[3] == srcShape[4], to[3] == dstShape[4],
                            let a = src.baseAddress, let z = dst.baseAddress {
                             (z + d).update(from: a + s, count: lengths[b] * dstShape[4])

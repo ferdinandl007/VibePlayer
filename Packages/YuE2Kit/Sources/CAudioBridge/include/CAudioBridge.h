@@ -13,6 +13,12 @@ const char *yu_error(void);
 
 yu_result *yu_render(yu_engine *engine, const char *lyrics, const char *style,
                      uint64_t seed, int frames, int steps, int minimum_frames, const char *prefix);
+typedef int (*yu_pcm_callback)(void *context, const float *samples, size_t frames,
+                               int sample_rate, int channels, size_t offset, size_t total);
+int yu_supports_pcm(const yu_engine *engine);
+yu_result *yu_render_observing_pcm(yu_engine *engine, const char *lyrics, const char *style,
+                                   uint64_t seed, int frames, int steps, int minimum_frames,
+                                   const char *prefix, yu_pcm_callback callback, void *context);
 const float *yu_samples(const yu_result *result);
 size_t yu_frames(const yu_result *result);
 int yu_channels(const yu_result *result);

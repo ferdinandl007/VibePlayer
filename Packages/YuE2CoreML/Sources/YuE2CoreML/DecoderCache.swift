@@ -35,17 +35,22 @@ enum DecoderCache {
     }
 
     func predict(
-        _ model: MLModel?, embedding: MLMultiArray, sine: MLMultiArray, cosine: MLMultiArray,
-        mask: MLMultiArray, positions: [Int]
+        _ model: MLModel?, embedding: MLMultiArray, mask: MLMultiArray?, positions: [Int]
     ) async throws -> any MLFeatureProvider {
-        var inputs = ["embedding": embedding, "sine": sine, "cosine": cosine, "mask": mask]
+        func modelInputs() throws -> [String: MLMultiArray] {
+            guard let mask else { throw YuE2Failure.inference("Missing decoder attention mask.") }
+            let (sine, cosine) = try rope(positions.map { [$0] })
+            return ["embedding": embedding, "sine": sine, "cosine": cosine, "mask": mask]
+        }
         switch self {
         case .stateful(let state, _):
             guard let model else { throw YuE2Failure.inference("Missing stateful decoder graph.") }
+            var inputs = try modelInputs()
             inputs["positions"] = try intTensor(positions)
             return try await model.prediction(from: provider(inputs), using: state)
         case .growable(let cache):
             guard let model else { throw YuE2Failure.inference("Missing growable decoder graph.") }
+            var inputs = try modelInputs()
             for component in CacheComponent.allCases {
                 inputs[component.rawValue] = cache[component]
             }
@@ -58,7 +63,7 @@ enum DecoderCache {
             return result
         case .metal(let decoder):
             return try autoreleasepool {
-                try decoder.predict(embedding: embedding, sine: sine, cosine: cosine, positions: positions)
+                try decoder.predict(embedding: embedding, positions: positions)
             }
         }
     }

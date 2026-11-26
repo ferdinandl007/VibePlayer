@@ -37,6 +37,11 @@ import Foundation
         let extended = builder.makeCreateRequest(idea: "a train at midnight", styles: "dreamy piano", instrumental: false, seed: 7, length: .extended).withLyrics("[Outro]\nHome at last")
         precondition(extended.createRenderer == .metal && extended.maxSemanticFrames == 6_400 && extended.minimumSemanticFrames == 5_250)
         precondition(extended.style.contains("extended arrangement with a closing section"))
+        let fullSong = builder.makeCreateRequest(idea: "Lo-fi", styles: "", instrumental: true, seed: 7, length: .fullSong)
+        precondition(fullSong.minimumSemanticFrames == 3_000 && fullSong.maxSemanticFrames == 5_200)
+        precondition(AppleMusicQuery.parse("I want a Taylor Swift song")?.term == "Taylor Swift")
+        precondition(AppleMusicQuery.parse("Play Shake It Off by Taylor Swift")?.artistOnly == false)
+        precondition(AppleMusicQuery.parse("Make a piano song with a melancholy chorus") == nil)
         print("Music prompt checks passed")
     }
 }

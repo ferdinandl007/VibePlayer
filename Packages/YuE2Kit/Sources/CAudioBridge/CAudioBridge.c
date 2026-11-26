@@ -17,6 +17,8 @@ struct yu_engine {
     audiocpp_registry *registry;
     audiocpp_model *model;
     audiocpp_session *session;
+    audiocpp_status (*session_run_pcm)(audiocpp_session *, const audiocpp_request *, yu_pcm_callback,
+                                       void *, audiocpp_result **);
 #define DECLARE(name) __typeof__(&audiocpp_##name) name;
     AUDIO_FUNCTIONS(DECLARE)
 #undef DECLARE
@@ -67,6 +69,7 @@ yu_engine *yu_open(const char *library, const char *weights, const char *spec, i
     if (!engine->name) { fail("load audiocpp_" #name, dlerror()); goto failed; }
     AUDIO_FUNCTIONS(LOAD)
 #undef LOAD
+    engine->session_run_pcm = (__typeof__(engine->session_run_pcm))dlsym(engine->library, "audiocpp_yue2_session_run_pcm");
 
     audiocpp_model_config model_config = {.family_hint = "yue2", .model_spec_override = spec};
     audiocpp_backend_config backend = {.backend = "metal", .device = 0, .threads = 8};
@@ -122,6 +125,18 @@ void yu_result_close(yu_result *result) {
 
 yu_result *yu_render(yu_engine *engine, const char *lyrics, const char *style,
                      uint64_t seed, int frames, int steps, int minimum_frames, const char *prefix) {
+    return yu_render_observing_pcm(engine, lyrics, style, seed, frames, steps, minimum_frames, prefix, NULL, NULL);
+}
+
+int yu_supports_pcm(const yu_engine *engine) { return engine->session_run_pcm != NULL; }
+
+yu_result *yu_render_observing_pcm(yu_engine *engine, const char *lyrics, const char *style,
+                                   uint64_t seed, int frames, int steps, int minimum_frames,
+                                   const char *prefix, yu_pcm_callback callback, void *context) {
+    if (callback && !yu_supports_pcm(engine)) {
+        fail("stream YuE2 waveform", "this audio.cpp library does not expose PCM tiles");
+        return NULL;
+    }
     audiocpp_request *request = engine->request_create();
     yu_result *result = calloc(1, sizeof(*result));
     if (!request || !result) {
@@ -147,7 +162,10 @@ yu_result *yu_render(yu_engine *engine, const char *lyrics, const char *style,
         if (options[i][1] && engine->request_set_option(request, options[i][0], options[i][1]) != AUDIOCPP_OK)
             goto failed;
     }
-    if (engine->session_run(engine->session, request, &result->raw) != AUDIOCPP_OK ||
+    audiocpp_status status = callback
+        ? engine->session_run_pcm(engine->session, request, callback, context, &result->raw)
+        : engine->session_run(engine->session, request, &result->raw);
+    if (status != AUDIOCPP_OK ||
         engine->result_audio(result->raw, &result->samples, &result->frames, &result->rate,
                              &result->channels) != AUDIOCPP_OK)
         goto failed;

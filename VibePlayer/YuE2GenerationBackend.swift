@@ -4,6 +4,7 @@ import YuE2CoreML
 import AVFoundation
 #endif
 #if os(macOS)
+import Synchronization
 import YuE2Kit
 #endif
 
@@ -37,7 +38,28 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
         #endif
         return metalModel?.renderer.supportsStreamingAcoustics == true
     }
-    var canCreateExtended: Bool { (metalModel?.renderer.maximumFrames ?? 0) >= CreateLength.extended.maximumFrames }
+    var canFastFullSong: Bool {
+        #if os(macOS)
+        return metalModel != nil && native?.hasFastPCMRuntime == true
+        #else
+        return false
+        #endif
+    }
+    var canPrepareRadioPair: Bool {
+        #if os(macOS)
+        metalModel?.renderer.supportsSongPair == true && native?.hasPCMRuntime == true
+        #else
+        false
+        #endif
+    }
+    var canCreateExtended: Bool {
+        #if os(macOS)
+        if metalModel == nil, native != nil { return true }
+        return (metalModel?.renderer.maximumFrames ?? 0) >= CreateLength.extended.maximumFrames
+        #else
+        return false
+        #endif
+    }
 
     func promptUsage(for request: MusicGenerationRequest) async throws -> MusicPromptUsage? {
         guard let renderer = metalModel?.renderer else { return nil }
@@ -70,8 +92,11 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
     }
 
     func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> URL {
+                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
         guard isAvailable else { throw MusicGenerationError.metalUnavailable }
+        if request.createAcoustics == .fastFullSong, !canFastFullSong {
+            throw MusicGenerationError.fastFullSongUnavailable
+        }
         while rendering {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 100_000_000)
@@ -85,14 +110,14 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
         do {
             #if os(macOS)
             await native?.finishPreparing()
-            let usesNative = request.purpose == .radio || request.createAcoustics == .streaming || metalModel == nil
+            let usesNative = (request.purpose == .radio && native?.hasPCMRuntime != true && native?.hasFastPCMRuntime != true) ||
+                request.createAcoustics == .streaming || metalModel == nil
             if usesNative, let native, request.createRenderer != .metalPaired {
-                try await native.render(request, to: output, onPreview: onPreview, onProgress: onProgress)
-                return output
+                let tokens = try await native.render(request, to: output, onPreview: onPreview, onProgress: onProgress)
+                return MusicGenerationOutput(url: output, semanticTokens: tokens)
             }
             #endif
-            try await renderCoreML(request, to: output, onPreview: onPreview, onProgress: onProgress)
-            return output
+            return try await renderCoreML(request, to: output, onPreview: onPreview, onProgress: onProgress)
         } catch {
             try? FileManager.default.removeItem(at: output)
             throw error
@@ -101,7 +126,7 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
 
     private func renderCoreML(_ request: MusicGenerationRequest, to output: URL,
                               onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                              onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws {
+                              onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
         guard let model = metalModel else { throw MusicGenerationError.metalUnavailable }
         let renderer: YuE2Renderer
         if request.purpose == .createdSong, request.createRenderer == .metalPaired {
@@ -127,18 +152,16 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
         let radio = request.purpose == .radio
         guard radio || request.minimumSemanticFrames <= maxFrames else { throw MusicGenerationError.extendedUnavailable }
         let minimum = radio ? min(request.minimumSemanticFrames, maxFrames) : request.minimumSemanticFrames
+        let prefix = Array(request.semanticPrefix.prefix(max(0, maxFrames - 250)))
         let profile: AcousticProfile = switch request.createAcoustics {
         case .streaming: .streaming
         case .reference: radio && renderer.supportsFastAcoustics ? .fast : .reference
+        case .fastFullSong: .reference
         }
         let song = SongRequest(lyrics: request.lyrics, style: request.style, seed: request.seed,
-                               maximumFrames: maxFrames, minimumFrames: minimum,
-                               acousticProfile: profile)
-        let preview: (@Sendable (SongAudioPreview) -> Void)?
-        if let onPreview {
-            preview = { audio in onPreview(MusicAudioPreview(samples: audio.samples, totalFrames: audio.totalFrames, startFrame: audio.startFrame)) }
-        } else { preview = nil }
-        _ = try await renderer.render(song, to: output, streamAudio: preview != nil, onPreview: preview) { progress in
+                               maximumFrames: maxFrames, minimumFrames: max(minimum, prefix.count + (prefix.isEmpty ? 0 : 250)),
+                               acousticProfile: profile, semanticPrefix: prefix.isEmpty ? nil : prefix)
+        let report: @Sendable (SongProgress) -> Void = { progress in
             switch progress {
             case .tokens(let count, let limit): onProgress(.tokens(count, limit))
             case .synthesis(let step, let total): onProgress(.synthesis(step, total))
@@ -146,6 +169,20 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
             case .workerRetry: break
             }
         }
+        #if os(macOS)
+        if request.createAcoustics != .streaming, let native,
+           let rendered = try await native.renderHybrid(song, with: renderer, steps: request.synthesisSteps, to: output,
+                                                        acoustics: request.createAcoustics, purpose: request.purpose,
+                                                        successorSeed: request.radioSuccessorSeed,
+                                                        onPreview: onPreview, onProgress: report) { return rendered }
+        #endif
+        let preview: (@Sendable (SongAudioPreview) -> Void)?
+        if let onPreview {
+            preview = { audio in onPreview(MusicAudioPreview(samples: audio.samples, totalFrames: audio.totalFrames, startFrame: audio.startFrame)) }
+        } else { preview = nil }
+        let result = try await renderer.render(song, to: output, streamAudio: preview != nil, onPreview: preview,
+                                               onProgress: report)
+        return MusicGenerationOutput(url: output, semanticTokens: result.codecTokens)
     }
 }
 
@@ -153,15 +190,23 @@ final class YuE2GenerationBackend: MusicGenerationBackend {
 @MainActor
 private final class MacYuE2Renderer {
     private let library: URL
+    private let fastLibrary: URL?
+    let hasPCMRuntime: Bool
+    var hasFastPCMRuntime: Bool { fastLibrary != nil }
     private let weights: URL
     private let spec: URL
-    private var resident: (mode: YuE2Engine.SynthesisMode, engine: YuE2Engine)?
+    private var resident: (mode: YuE2Engine.SynthesisMode, library: URL, engine: YuE2Engine)?
     private var preparation: Task<YuE2Engine, Error>?
+    private var reservedRadioDraft: (request: SongRequest, draft: SongDraft)?
 
     init?() {
         guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let root = support.appendingPathComponent("YuE2NativeAssets", isDirectory: true)
-        library = root.appendingPathComponent("libaudiocpp.dylib")
+        let pcmLibrary = root.appendingPathComponent("libaudiocpp-pcm.dylib")
+        hasPCMRuntime = FileManager.default.isReadableFile(atPath: pcmLibrary.path)
+        library = hasPCMRuntime ? pcmLibrary : root.appendingPathComponent("libaudiocpp.dylib")
+        let fastPCM = root.appendingPathComponent("libaudiocpp-pcm-fast.dylib")
+        fastLibrary = FileManager.default.isReadableFile(atPath: fastPCM.path) ? fastPCM : nil
         weights = root.appendingPathComponent("weights", isDirectory: true)
         spec = root.appendingPathComponent("yue2.json")
         let files = [library, spec] + ["yue2-3b-q4_0.gguf", "yue2-vae-f16.gguf", "sidecars/yue2-qwen.tiktoken",
@@ -183,24 +228,125 @@ private final class MacYuE2Renderer {
 
     func finishPreparing() async {
         guard let preparation else { return }
-        if let engine = try? await preparation.value { resident = (.streamingPreview, engine) }
+        if let engine = try? await preparation.value { resident = (.streamingPreview, library, engine) }
         self.preparation = nil
+    }
+
+    private func loadWaveformEngine(using runtime: URL) async throws -> YuE2Engine? {
+        let engine = try await engine(for: .fullSong, using: runtime)
+        return engine.supportsWaveformStreaming ? engine : nil
+    }
+
+    private func waveformEngine(acoustics: CreateAcoustics, purpose: MusicGenerationRequest.Purpose) async throws -> YuE2Engine? {
+        if acoustics == .fastFullSong {
+            guard let fastLibrary, let engine = try await loadWaveformEngine(using: fastLibrary) else {
+                throw MusicGenerationError.fastFullSongUnavailable
+            }
+            return engine
+        }
+        if purpose == .radio, let fastLibrary,
+           let engine = try? await loadWaveformEngine(using: fastLibrary) {
+            return engine
+        }
+        try Task.checkCancellation()
+        guard hasPCMRuntime else { return nil }
+        return try? await loadWaveformEngine(using: library)
+    }
+
+    private func compose(_ request: SongRequest, with renderer: YuE2Renderer,
+                         purpose: MusicGenerationRequest.Purpose, successorSeed: UInt64?,
+                         onProgress: @escaping @Sendable (SongProgress) -> Void) async throws -> SongDraft {
+        if purpose == .radio {
+            let reserved = reservedRadioDraft
+            reservedRadioDraft = nil
+            if let reserved, reserved.request == request {
+                onProgress(.tokens(count: reserved.draft.codecTokens.count, limit: reserved.draft.codecTokens.count))
+                return reserved.draft
+            }
+            if let successorSeed, renderer.supportsSongPair {
+                var successor = request
+                successor.seed = successorSeed
+                do {
+                    let framesReported = Mutex(-1)
+                    let (first, second) = try await renderer.composePair(request, successor) { _, progress in
+                        if case .tokens(let frames, _) = progress, framesReported.withLock({ highest in
+                            guard frames > highest else { return false }
+                            highest = frames
+                            return true
+                        }) {
+                            onProgress(progress)
+                        }
+                    }
+                    reservedRadioDraft = (successor, second)
+                    return first
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try Task.checkCancellation()
+                    // The single-song path remains available if the larger cache cannot be allocated.
+                }
+            }
+        }
+        return try await renderer.compose(request, onProgress: onProgress)
+    }
+
+    func renderHybrid(_ request: SongRequest, with renderer: YuE2Renderer, steps: Int, to output: URL,
+                      acoustics: CreateAcoustics, purpose: MusicGenerationRequest.Purpose, successorSeed: UInt64?,
+                      onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
+                      onProgress: @escaping @Sendable (SongProgress) -> Void) async throws -> MusicGenerationOutput? {
+        guard let engine = try await waveformEngine(acoustics: acoustics, purpose: purpose) else { return nil }
+        try Task.checkCancellation()
+        let draft = try await compose(request, with: renderer, purpose: purpose, successorSeed: successorSeed,
+                                      onProgress: onProgress)
+        let prompt = YuE2Prompt(lyrics: request.lyrics, style: request.style, seed: request.seed)
+        let file = try NativeSongFile(url: output)
+        onProgress(.synthesis(step: 0, total: steps))
+        if let onPreview {
+            let (tiles, continuation) = AsyncStream<YuE2WaveformChunk>.makeStream()
+            async let rendering: Void = renderTiles(engine, prompt: prompt, draft: draft, steps: steps, to: continuation)
+            for await tile in tiles {
+                try Task.checkCancellation()
+                if tile.startFrame == 0 { onProgress(.waveform) }
+                let chunk = try await file.append(tile.audio, totalFrames: tile.totalFrames)
+                onPreview(chunk)
+            }
+            try await rendering
+        } else {
+            let audio = try await engine.renderComposed(prompt, tokens: draft.codecTokens,
+                                                        naturalEnding: draft.naturalEnding, steps: steps)
+            _ = try await file.append(audio, totalFrames: audio.frameCount)
+            onProgress(.waveform)
+        }
+        return MusicGenerationOutput(url: output, semanticTokens: draft.codecTokens,
+                                     radioSuccessorSeed: purpose == .radio ? reservedRadioDraft?.request.seed : nil)
+    }
+
+    private func renderTiles(_ engine: YuE2Engine, prompt: YuE2Prompt, draft: SongDraft, steps: Int,
+                             to continuation: AsyncStream<YuE2WaveformChunk>.Continuation) async throws {
+        defer { continuation.finish() }
+        _ = try await engine.renderComposed(prompt, tokens: draft.codecTokens, naturalEnding: draft.naturalEnding,
+                                            steps: steps) { tile in continuation.yield(tile) }
+    }
+
+    private func engine(for mode: YuE2Engine.SynthesisMode, using preferredRuntime: URL? = nil) async throws -> YuE2Engine {
+        let runtime = preferredRuntime ?? library
+        if let resident, resident.mode == mode, resident.library == runtime { return resident.engine }
+        resident = nil
+        let engine = try await YuE2Engine.load(library: runtime, weights: weights, modelSpec: spec, mode: mode)
+        resident = (mode, runtime, engine)
+        return engine
     }
 
     func render(_ request: MusicGenerationRequest, to output: URL,
                 onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws {
+                onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> [Int] {
         try Task.checkCancellation()
-        let preview = request.purpose == .createdSong && request.createAcoustics == .streaming
+        let preview = request.purpose == .createdSong && request.createAcoustics == .streaming && request.semanticPrefix.isEmpty
         let mode: YuE2Engine.SynthesisMode = preview ? .streamingPreview : .fullSong
-        if resident?.mode != mode {
-            resident = nil
-            let engine = try await YuE2Engine.load(library: library, weights: weights, modelSpec: spec, mode: mode)
-            resident = (mode, engine)
-        }
-        guard let engine = resident?.engine else { throw MusicGenerationError.metalUnavailable }
+        let engine = try await engine(for: mode)
         let prompt = YuE2Prompt(lyrics: request.lyrics, style: request.style, seed: request.seed)
         let file = try NativeSongFile(url: output)
+        let tokens: [Int]
         if preview, let onPreview {
             let first = YuE2Engine.windowedPreviewCheckpoints[0]
             let stride = YuE2Engine.windowedPreviewCheckpoints[1] - first
@@ -209,19 +355,23 @@ private final class MacYuE2Renderer {
             let checkpoints = (YuE2Engine.windowedPreviewCheckpoints + [1192, 1780, 2536, 3712]).filter { $0 < end } + [end]
             onProgress(.tokens(0, end))
             let minimum = min(end, max(request.minimumSemanticFrames, 1750))
-            try await engine.renderProgressively(prompt, checkpoints: checkpoints, steps: 4, minimumFrames: minimum) { audio in
+            tokens = try await engine.renderProgressively(prompt, checkpoints: checkpoints, steps: 4, minimumFrames: minimum) { audio in
                 let chunk = try await file.append(audio, totalFrames: end * 1_920)
                 onPreview(chunk)
                 onProgress(.tokens((chunk.startFrame + audio.frameCount) / 1_920, end))
             }
         } else {
             onProgress(.tokens(0, request.maxSemanticFrames))
-            let audio = try await engine.render(prompt, frames: request.maxSemanticFrames,
-                                                steps: preview ? 4 : request.synthesisSteps,
-                                                minimumFrames: request.minimumSemanticFrames)
-            _ = try await file.append(audio, totalFrames: audio.frameCount)
+            let prefix = Array(request.semanticPrefix.prefix(request.maxSemanticFrames - 250))
+            let take = try await engine.renderTake(prompt, frames: request.maxSemanticFrames,
+                                                   steps: preview ? 4 : request.synthesisSteps,
+                                                   minimumFrames: max(request.minimumSemanticFrames, prefix.count + (prefix.isEmpty ? 0 : 250)),
+                                                   semanticPrefix: prefix)
+            _ = try await file.append(take.audio, totalFrames: take.audio.frameCount)
+            tokens = take.tokens
         }
         onProgress(.waveform)
+        return tokens
     }
 }
 
@@ -263,7 +413,7 @@ final class FixtureMusicGenerationBackend: MusicGenerationBackend {
     let isAvailable = true
     let canStreamAcoustics = true
     func generate(_ request: MusicGenerationRequest, onPreview: (@Sendable (MusicAudioPreview) -> Void)?,
-                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> URL {
+                  onProgress: @escaping @Sendable (MusicGenerationProgress) -> Void) async throws -> MusicGenerationOutput {
         let output = FileManager.default.temporaryDirectory.appendingPathComponent("fixture-\(UUID().uuidString).wav")
         let arguments = ProcessInfo.processInfo.arguments
         if request.purpose == .createdSong, request.createAcoustics == .reference,
@@ -275,7 +425,7 @@ final class FixtureMusicGenerationBackend: MusicGenerationBackend {
             onPreview(MusicAudioPreview(samples: Array(samples.prefix(48_000 * 9 * 2)), totalFrames: samples.count / 2))
             try await Task.sleep(for: .seconds(5))
             try writeFixture(samples, to: output)
-            return output
+            return MusicGenerationOutput(url: output)
         }
         if request.purpose == .createdSong, arguments.contains("--fixture-early-audio"), let onPreview {
             try await Task.sleep(for: .milliseconds(350))
@@ -289,18 +439,18 @@ final class FixtureMusicGenerationBackend: MusicGenerationBackend {
                                         totalFrames: samples.count / 2, startFrame: opening))
             try await Task.sleep(for: .seconds(12))
             try writeFixture(samples, to: output)
-            return output
+            return MusicGenerationOutput(url: output)
         }
         if request.purpose == .radio, arguments.contains("--fixture-radio-gap") {
             onProgress(.tokens(40, 512))
             try await Task.sleep(for: .seconds(3))
             try writeFixture(tone(frames: 48_000 * 2), to: output)
-            return output
+            return MusicGenerationOutput(url: output)
         }
         try await Task.sleep(for: .milliseconds(500))
         guard let source = Bundle.main.url(forResource: "atmosphere", withExtension: "wav") else { throw MusicGenerationError.unavailable }
         try FileManager.default.copyItem(at: source, to: output)
-        return output
+        return MusicGenerationOutput(url: output)
     }
 
     private func tone(frames: Int) -> [Int16] {

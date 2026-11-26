@@ -26,6 +26,35 @@ For experimental low-latency playback, load with `mode: .streamingPreview` and c
 
 Progressive playback re-renders the prefix at each checkpoint. The default schedule is for short previews. Use measured buffer lead and a playback clock to decide when to start a rhythm game and whether to extend the schedule. This package targets macOS. The supplied dylib is a macOS binary.
 
+## Full-context playback in Vibe Player
+
+On Apple silicon, Create's **High quality** mode can compose with Vibe Player's Metal shaders and pass the complete token sequence to audio.cpp for a single eight-step acoustic pass. An optional PCM callback hands off each finalized waveform tile as it decodes. The player queues those same samples into the saved WAV.
+
+Build the experimental PCM runtime from the pinned audio.cpp release using CMake and the Xcode Metal toolchain. Run these commands from `Packages/YuE2Kit`:
+
+```bash
+work=$(mktemp -d)
+git clone --depth 1 --branch v0.9.6 https://github.com/0xShug0/audio.cpp.git "$work/audio.cpp"
+git -C "$work/audio.cpp" apply "$PWD/Patches/audio-cpp-v0.9.6-waveform.patch"
+cmake -S "$work/audio.cpp" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 -DCMAKE_INSTALL_RPATH='@loader_path' \
+  -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DBUILD_SHARED_LIBS=OFF \
+  -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+  -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF -DAUDIOCPP_BUILD_C_API=ON \
+  -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=yue2 -DAUDIOCPP_VERSION=0.9.6
+cmake --build "$work/build" --parallel 8 --target audiocpp
+```
+
+Copy the compiled library (following the symlink from `$work/build/bin/libaudiocpp.dylib`) to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm.dylib`. Vibe Player also needs its indexed `YuE2MetalAssets` bundle for composing. The optional library enables the hybrid route for High quality and long Radio songs when it exports the waveform callback. Audio begins after composition and full-song acoustic synthesis, during waveform decoding.
+
+To enable **Fast Full Song** on Mac, build a second copy of the PCM runtime with `Patches/audio-cpp-v0.9.6-wide-attention.patch` also applied. Copy the fast build to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm-fast.dylib`, set its install name to `@rpath/libaudiocpp-pcm-fast.dylib` with `install_name_tool -id`, and re-sign it with `codesign --force --sign -`. This mode uses the same eight midpoint steps and full song context. High Quality opens the standard PCM library.
+
+On M3 Max, the fast runtime selects a 32-query attention tile at 5,000 or more acoustic query rows. The wider tile reuses key and value loads across more queries while preserving the order of each query's operations. Shorter contexts use the 16-query tile where supported.
+
+### Reference recordings on Mac
+
+Build the [`yue-tokenize` target](https://github.com/hangry-labs/yue2) for Apple silicon with `-DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON`. With upstream revision `bb064cf`, rename its top-level `VERSION` file and update the `file(STRINGS …)` path in `CMakeLists.txt` when building on a case-insensitive volume. The original filename can shadow the C++ `<version>` header. Under `~/Library/Application Support/YuE2NativeAssets/Reference`, place the executable beside `MERT-v2-FullSong-Q8_0.gguf` and `yue2-mothersuperior-realaudio-tokenizer-v4-Q8_0.gguf` from the [GGUF publisher](https://huggingface.co/botp/YuE2-GGUF). The app invokes Metal locally when a recording is selected. The extracted codes provide musical context for a new take. Exact opening audio is preserved when remixing a generated Library song.
+
 ## Run the benchmark
 
 From this directory, with the verified runtime available on disk:

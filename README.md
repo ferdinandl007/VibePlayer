@@ -57,7 +57,7 @@ The app looks for an indexed version 3 bundle named `YuE2MetalAssets` in its app
 2. Follow the [YuE2CoreML export and Metal indexing instructions](Packages/YuE2CoreML/README.md#metal-decoder-preview).
 3. Install the resulting `YuE2MetalAssets` directory in the app bundle or its Application Support directory. Keep the complete bundle together.
 
-On Apple silicon Macs, an additional `YuE2NativeAssets` directory in Application Support enables the audio.cpp Metal runtime for Early playback and Radio. Opening Create prewarms the four-step preview. Radio queues complete eight-step renders. The directory contains `libaudiocpp.dylib`, `yue2.json`, and a `weights/` directory with the GGUF files and sidecars. See [YuE2Kit's runtime and asset instructions](Packages/YuE2Kit/README.md#runtime-and-weights).
+On Apple silicon Macs, the `YuE2NativeAssets` directory in Application Support enables the audio.cpp Metal runtime. High Quality uses `libaudiocpp-pcm.dylib` for full-context audio rendering. Fast Full Song and Radio use `libaudiocpp-pcm-fast.dylib` when installed, with the same eight synthesis steps and full context. Radio can also use the standard runtime. See [YuE2Kit's runtime and asset instructions](Packages/YuE2Kit/README.md#runtime-and-weights).
 
 Model assets can require several gigabytes. The separately distributed YuE2 weights use **CC BY-NC 4.0**; check the [model card](https://huggingface.co/m-a-p/YuE2-3B) before using or distributing them.
 
@@ -65,13 +65,19 @@ Model assets can require several gigabytes. The separately distributed YuE2 weig
 
 ### Radio
 
-A station becomes a generation request containing the selected style, voice, a random seed, and a length range. For vocal tracks, the writing model can draft original lyrics; instrumental requests leave lyrics empty. Radio renders one song at a time and keeps up to two ready. Changing a station or its sound controls discards the old queue and schedules a replacement; existing audio continues until the replacement is ready. **Prepare songs** can fill the queue while playback is paused.
+A station becomes a generation request containing the selected style, voice, a random seed, and a length range. For vocal tracks, the writing model can draft original lyrics; instrumental requests leave lyrics empty. Radio renders one song at a time and keeps up to two ready. On Mac, it fills both slots before going on air from a cold start. It renders tracks from 2:00 to 3:28 with eight full-context acoustic steps. **Prepare songs** can fill the queue while playback is paused.
+
+Adjusting the controls during a generated song uses the music already heard as context for the revised take. Radio can keep one prepared song in reserve if the current song ends before the revision is ready. Once the revision is ready, Radio blends to it and carries the new settings into later tracks.
 
 ### Create
 
 Create sends the sound description and lyrics to YuE2 as separate fields. The app checks the model's token budget and can ask the writing model to shorten a prompt. You can queue another idea while a song is rendering and cancel a render in progress. On iOS, Create is capped at 4,200 semantic frames, or 2:48 of audio.
 
-**Early playback** generates overlapping sections and starts after building a buffer. If generation falls behind, playback fades out and resumes from the same position when enough audio is ready. **High quality** synthesizes with full acoustic context and starts when the waveform decoder has built a buffer. Vocal prompts default to High quality and instrumental prompts default to Early playback where available; an explicit choice applies to subsequent prompts.
+**Early playback** generates overlapping sections and starts after building a buffer. If generation falls behind, playback fades out and resumes from the same position when enough audio is ready. **High quality** synthesizes with full acoustic context and starts when the waveform decoder has built a buffer. Mac Create defaults to High quality and **Full song**, allowing an ending between 2:00 and 3:28. Compatible models also offer **Extended** for 3:30 to 4:16. On iOS, vocal prompts default to High quality and instrumentals to Early playback when available. An explicit choice applies to subsequent prompts.
+
+Use **Remix in Create** from a generated song’s Library menu to keep its original audio up to a chosen point and blend into a new ending. On Mac, the optional reference encoder can also open older Library songs and local recordings. It listens to up to the first 60 seconds and extracts musical context locally. The **Reference** button also accepts a file of zero-based YuE2 codes. [Reference encoder and weight files](https://hangry-labs.github.io/yue2/docs/MODELS.html)
+
+An explicit artist request such as “I want a Taylor Swift song” opens released tracks in Apple Music. Choose **Create an original song instead** to use the prompt for generation.
 
 ### Writing and privacy
 

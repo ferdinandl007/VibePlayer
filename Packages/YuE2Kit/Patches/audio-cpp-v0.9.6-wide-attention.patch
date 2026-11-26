@@ -1,0 +1,356 @@
+diff --git a/external/ggml/src/ggml-metal/ggml-metal-device.cpp b/external/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 7380d90..b989e82 100644
+--- a/external/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/external/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1555,7 +1555,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
+         bool    has_bias,
+         bool    has_scap,
+         bool    has_kvpad,
+-        int32_t nsg) {
++        int32_t nsg,
++        int32_t query_rows) {
+     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+ 
+     char base[256];
+@@ -1570,11 +1571,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
+     // do bounds checks for the mask?
+     const bool bc_mask = op->src[3] && (op->src[3]->ne[1] % 8 != 0);
+ 
+-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
++    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d%s",
+             "flash_attn_ext",
+             ggml_type_name(op->src[1]->type),
+             dk,
+-            dv);
++            dv,
++            query_rows == 16 ? "_q16" : query_rows == 32 ? "_q32" : "");
+ 
+     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_kvpad=%d_bcm=%d_ns10=%d_ns20=%d_nsg=%d",
+             base,
+diff --git a/external/ggml/src/ggml-metal/ggml-metal-device.h b/external/ggml/src/ggml-metal/ggml-metal-device.h
+index e6c046d..0d0cdf5 100644
+--- a/external/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/external/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -196,7 +196,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
+         bool    has_bias,
+         bool    has_scap,
+         bool    has_kvpad,
+-        int32_t nsg);
++        int32_t nsg,
++        int32_t query_rows);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
+         ggml_metal_library_t lib,
+diff --git a/external/ggml/src/ggml-metal/ggml-metal-ops.cpp b/external/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 843b4a3..06a97af 100644
+--- a/external/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/external/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -11,7 +11,8 @@
+ #include <cassert>
+ #include <algorithm>
+ #include <limits>
+-#include <cmath>
++#include <cstring>
++#include <cmath>
+ 
+ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
+     if (!t) {
+@@ -3079,7 +3080,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+ 
+     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
+         // half8x8 kernel
+-        const int nqptg = OP_FLASH_ATTN_EXT_NQPSG; // queries per threadgroup
++        const bool wide = !has_mask && !has_sinks && !has_bias && !has_scap &&
++            op->src[1]->type == GGML_TYPE_F16 && ne00 == 128 && ne10 == 128 && ne20 == 128 && ne01 >= 1024;
++        // On the measured M3 Max, the wider tile saves KV reads at long contexts.
++        const bool long_tile = wide && ne01 >= 5000 && props_dev->max_theadgroup_memory_size >= 32768 &&
++            std::strcmp(props_dev->desc, "Apple M3 Max") == 0;
++        const int nqptg = long_tile ? 32 : (wide ? 16 : OP_FLASH_ATTN_EXT_NQPSG);
+         const int ncpsg = OP_FLASH_ATTN_EXT_NCPSG; // cache values per simdgroup
+ 
+         GGML_ASSERT(nqptg <= 32);
+@@ -3170,7 +3176,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+         // the shared memory needed for the simdgroups to load the KV cache
+         // each thread loads (dequantizes) 16 head elements, there are 32 threads in th SG
+         //
+-#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
++#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + (long_tile ? 2 : 4)*ncpsg) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
+ 
+         //int64_t nsgmax = 4;
+         //
+@@ -3227,7 +3233,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             /*.logit_softcap =*/ logit_softcap,
+         };
+ 
+-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg);
++        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nqptg);
+ 
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+diff --git a/external/ggml/src/ggml-metal/ggml-metal.metal b/external/ggml/src/ggml-metal/ggml-metal.metal
+index 4e77a38..3d90ec0 100644
+--- a/external/ggml/src/ggml-metal/ggml-metal.metal
++++ b/external/ggml/src/ggml-metal/ggml-metal.metal
+@@ -6875,7 +6875,9 @@ void kernel_flash_attn_ext_impl(
+ 
+     constexpr short NW  = N_SIMDWIDTH;
+     constexpr short NQ  = Q/NSG;
+-    constexpr short SH  = 2*C; // shared memory per simdgroup (s_t == float)
++    constexpr short QB  = Q/8; // One SIMD-group matrix covers eight query rows.
++    constexpr bool compact = Q == 32;
++    constexpr short SH = compact ? C : 2*C; // Compact tiles compute tail masking in registers.
+ 
+     constexpr short TS = 2*SH;
+     constexpr short T  = DK + 2*PV; // shared memory size per query in (half)
+@@ -6990,14 +6992,16 @@ void kernel_flash_attn_ext_impl(
+                 v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+ 
+                 if (!FC_flash_attn_ext_has_mask) {
+-                    threadgroup half * sm = (threadgroup half *) (sm2);
++                    if constexpr (!compact) {
++                        threadgroup half * sm = (threadgroup half *) (sm2);
+ 
+-                    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+-                        const short j = jj*NSG + sgitg;
++                        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
++                            const short j = jj*NSG + sgitg;
+ 
+-                        for (short i = tiisg; i < C; i += NW) {
+-                            if (ic + i >= args.ne11) {
+-                                sm[2*j*SH + i] = -MAXHALF;
++                            for (short i = tiisg; i < C; i += NW) {
++                                if (ic + i >= args.ne11) {
++                                    sm[2*j*SH + i] = -MAXHALF;
++                                }
+                             }
+                         }
+                     }
+@@ -7087,48 +7091,47 @@ void kernel_flash_attn_ext_impl(
+                 constexpr short NC = (C/8)/NSG;
+ 
+                 FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+-                    qk8x8_t mqk = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
++                    qk8x8_t mqk[QB];
++                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                        mqk[qb] = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
++                    }
+ 
+                     if (DK % 16 != 0) {
+-                        k8x8_t mk;
+-                        q8x8_t mq;
+-
+                         FOR_UNROLL (short i = 0; i < DK8; ++i) {
++                            k8x8_t mk;
+                             simdgroup_barrier(mem_flags::mem_none);
+-
+                             simdgroup_load(mk, pk + 8*i, NS10, 0, true);
+-                            simdgroup_load(mq, pq + 8*i, DK);
+-
+-                            simdgroup_barrier(mem_flags::mem_none);
+-
+-                            simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
++                            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                                q8x8_t mq;
++                                simdgroup_load(mq, pq + 8*qb*DK + 8*i, DK);
++                                simdgroup_barrier(mem_flags::mem_none);
++                                simdgroup_multiply_accumulate(mqk[qb], mq, mk, mqk[qb]);
++                            }
+                         }
+                     } else {
+-                        k8x8_t mk[2];
+-                        q8x8_t mq[2];
+-
+-                        // note: too much unroll can tank the performance for large heads
+                         #pragma unroll (MIN(DK8/2, 4*NSG))
+                         for (short i = 0; i < DK8/2; ++i) {
++                            k8x8_t mk[2];
+                             simdgroup_barrier(mem_flags::mem_none);
+-
+-                            simdgroup_load(mq[0], pq + 0*8 + 16*i, DK);
+-                            simdgroup_load(mq[1], pq + 1*8 + 16*i, DK);
+-
+-                            simdgroup_load(mk[0], pk + 0*8 + 16*i, NS10, 0, true);
+-                            simdgroup_load(mk[1], pk + 1*8 + 16*i, NS10, 0, true);
+-
+-                            simdgroup_barrier(mem_flags::mem_none);
+-
+-                            simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
+-                            simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
++                            simdgroup_load(mk[0], pk + 16*i, NS10, 0, true);
++                            simdgroup_load(mk[1], pk + 8 + 16*i, NS10, 0, true);
++
++                            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                                q8x8_t mq[2];
++                                simdgroup_load(mq[0], pq + 8*qb*DK + 16*i, DK);
++                                simdgroup_load(mq[1], pq + 8*qb*DK + 8 + 16*i, DK);
++                                simdgroup_barrier(mem_flags::mem_none);
++                                simdgroup_multiply_accumulate(mqk[qb], mq[0], mk[0], mqk[qb]);
++                                simdgroup_multiply_accumulate(mqk[qb], mq[1], mk[1], mqk[qb]);
++                            }
+                         }
+                     }
+ 
+-                    simdgroup_store(mqk, ps, SH, 0, false);
+-
++                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                        simdgroup_store(mqk[qb], ps + 8*qb*SH, SH, 0, false);
++                    }
+                     pk += 8*(NSG*NS10);
+-                    ps += 8*(NSG);
++                    ps += 8*NSG;
+                 }
+             } else {
+                 // TODO: this is the quantized K cache branch - not optimized yet
+@@ -7209,11 +7212,20 @@ void kernel_flash_attn_ext_impl(
+                 }
+ 
+                 // mqk = mqk + slope*mask
+-                if (blk_cur != 2) {
+-                    if (FC_flash_attn_ext_has_bias) {
+-                        s2 += s2_t(sm2[j*SH + tiisg])*slope;
+-                    } else {
+-                        s2 += s2_t(sm2[j*SH + tiisg]);
++                if constexpr (compact) {
++                    if (FC_flash_attn_ext_has_kvpad && (ic0 + 1)*C > args.ne11) {
++                        const int tail = args.ne11 - ic0*C;
++                        const int first = 2*tiisg;
++                        s2 += float2(first >= tail ? -MAXHALF : 0.0f,
++                                     first + 1 >= tail ? -MAXHALF : 0.0f);
++                    }
++                } else {
++                    if (blk_cur != 2) {
++                        if (FC_flash_attn_ext_has_bias) {
++                            s2 += s2_t(sm2[j*SH + tiisg])*slope;
++                        } else {
++                            s2 += s2_t(sm2[j*SH + tiisg]);
++                        }
+                     }
+                 }
+ 
+@@ -7250,74 +7262,66 @@ void kernel_flash_attn_ext_impl(
+ 
+                     constexpr short NO = PV8/NSG;
+ 
+-                    o8x8_t lo[NO];
+-
+-                    {
+-                        auto sot = so + 8*sgitg;
++                    o8x8_t lo[QB][NO];
+ 
++                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                        auto sot = so + 8*qb*PV + 8*sgitg;
+                         FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+-                            simdgroup_load(lo[ii], sot, PV, 0, false);
+-
++                            simdgroup_load(lo[qb][ii], sot, PV, 0, false);
+                             sot += 8*NSG;
+                         }
+                     }
+ 
+-                    {
+-                        device const v_t * pv = (device const v_t *) (v + ic*args.nb21);
+-
+-                        pv += 8*sgitg;
++                    device const v_t * pv = (device const v_t *) (v + ic*args.nb21) + 8*sgitg;
+ 
+-                        if (DV <= 64) {
+-                            FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+-                                s8x8_t vs;
+-                                simdgroup_load(vs, ss + 8*cc, SH, 0, false);
+-
+-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
+-                                    v8x8_t mv[2];
+-
+-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG, NS20, 0, false);
+-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
++                    if (DV <= 64) {
++                        FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
++                            s8x8_t vs[QB];
++                            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                                simdgroup_load(vs[qb], ss + 8*qb*SH + 8*cc, SH, 0, false);
++                            }
+ 
+-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs, mv[0], lo[2*ii + 0]);
+-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs, mv[1], lo[2*ii + 1]);
++                            FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
++                                v8x8_t mv[2];
++                                simdgroup_load(mv[0], pv + 16*ii*NSG, NS20, 0, false);
++                                simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
++                                FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                                    simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb], mv[0], lo[qb][2*ii + 0]);
++                                    simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb], mv[1], lo[qb][2*ii + 1]);
+                                 }
+-
+-                                pv  += 8*NS20;
+                             }
+-                        } else {
+-                            constexpr short NC = (C/8)/2;
+-
+-                            FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
+-                                s8x8_t vs[2];
+-
+-                                simdgroup_load(vs[0], ss + 16*cc + 0, SH, 0, false);
+-                                simdgroup_load(vs[1], ss + 16*cc + 8, SH, 0, false);
+-
+-                                FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
+-                                    v8x8_t mv[4];
+-
+-                                    simdgroup_load(mv[0], pv + 0*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+-                                    simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG + 0*8*NS20, NS20, 0, false);
+-                                    simdgroup_load(mv[2], pv + 0*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
+-                                    simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 1*8*NS20, NS20, 0, false);
++                            pv += 8*NS20;
++                        }
++                    } else {
++                        constexpr short NC = (C/8)/2;
++                        FOR_UNROLL (short cc = 0; cc < NC; ++cc) {
++                            s8x8_t vs[QB][2];
++                            FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                                simdgroup_load(vs[qb][0], ss + 8*qb*SH + 16*cc, SH, 0, false);
++                                simdgroup_load(vs[qb][1], ss + 8*qb*SH + 16*cc + 8, SH, 0, false);
++                            }
+ 
+-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[0], mv[0], lo[2*ii + 0]);
+-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[0], mv[1], lo[2*ii + 1]);
+-                                    simdgroup_multiply_accumulate(lo[2*ii + 0], vs[1], mv[2], lo[2*ii + 0]);
+-                                    simdgroup_multiply_accumulate(lo[2*ii + 1], vs[1], mv[3], lo[2*ii + 1]);
++                            FOR_UNROLL (short ii = 0; ii < NO/2; ++ii) {
++                                v8x8_t mv[4];
++                                simdgroup_load(mv[0], pv + 16*ii*NSG, NS20, 0, false);
++                                simdgroup_load(mv[1], pv + 8*NSG + 16*ii*NSG, NS20, 0, false);
++                                simdgroup_load(mv[2], pv + 16*ii*NSG + 8*NS20, NS20, 0, false);
++                                simdgroup_load(mv[3], pv + 8*NSG + 16*ii*NSG + 8*NS20, NS20, 0, false);
++                                FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                                    simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][0], mv[0], lo[qb][2*ii + 0]);
++                                    simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][0], mv[1], lo[qb][2*ii + 1]);
++                                    simdgroup_multiply_accumulate(lo[qb][2*ii + 0], vs[qb][1], mv[2], lo[qb][2*ii + 0]);
++                                    simdgroup_multiply_accumulate(lo[qb][2*ii + 1], vs[qb][1], mv[3], lo[qb][2*ii + 1]);
+                                 }
+-
+-                                pv  += 2*8*NS20;
+                             }
++                            pv += 16*NS20;
+                         }
+                     }
+ 
+-                    {
+-                        auto sot = so + 8*sgitg;
+-
++                    FOR_UNROLL (short qb = 0; qb < QB; ++qb) {
++                        auto sot = so + 8*qb*PV + 8*sgitg;
+                         FOR_UNROLL (short ii = 0; ii < NO; ++ii) {
+-                            simdgroup_store(lo[ii], sot, PV, 0, false);
+-
++                            simdgroup_store(lo[qb][ii], sot, PV, 0, false);
+                             sot += 8*NSG;
+                         }
+                     }
+@@ -7553,6 +7557,8 @@ template [[host_name("kernel_flash_attn_ext_f16_dk80_dv80"  )]]  kernel flash_at
+ template [[host_name("kernel_flash_attn_ext_f16_dk96_dv96"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  96,  96>;
+ template [[host_name("kernel_flash_attn_ext_f16_dk112_dv112")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  112, 112>;
+ template [[host_name("kernel_flash_attn_ext_f16_dk128_dv128")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  128, 128>;
++template [[host_name("kernel_flash_attn_ext_f16_dk128_dv128_q16")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  128, 128, 16>;
++template [[host_name("kernel_flash_attn_ext_f16_dk128_dv128_q32")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  128, 128, 32>;
+ template [[host_name("kernel_flash_attn_ext_f16_dk192_dv192")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  192, 192>;
+ template [[host_name("kernel_flash_attn_ext_f16_dk192_dv128")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  192, 128>;
+ template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  256, 256>;

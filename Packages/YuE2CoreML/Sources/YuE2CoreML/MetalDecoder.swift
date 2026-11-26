@@ -42,6 +42,8 @@ private struct MetalWeightIndex: Decodable {
 
 private struct DecoderKernels {
     let project: any MTLComputePipelineState
+    let projectFour: (any MTLComputePipelineState)?
+    let projectionRows: Int
     let rms: any MTLComputePipelineState
     let rotary: any MTLComputePipelineState
     let attend: any MTLComputePipelineState
@@ -49,7 +51,7 @@ private struct DecoderKernels {
     let residual: any MTLComputePipelineState
     let gate: any MTLComputePipelineState
 
-    init(_ device: any MTLDevice, paired: Bool) throws {
+    init(_ device: any MTLDevice, paired: Bool, songCount: Int) throws {
         #if SWIFT_PACKAGE
         let bundle = Bundle.module
         #else
@@ -59,19 +61,30 @@ private struct DecoderKernels {
             throw YuE2Failure.assets("Missing Metal decoder kernels.")
         }
         let options = MTLCompileOptions()
-        if paired { options.preprocessorMacros = ["YUE2_PAIRED_LAYOUT": NSNumber(value: 1)] }
+        #if os(macOS)
+        let tuneForM3Max = !paired && device.name == "Apple M3 Max"
+        #else
+        let tuneForM3Max = false
+        #endif
+        projectionRows = tuneForM3Max ? 8 : 4
+        if tuneForM3Max {
+            options.preprocessorMacros = ["YUE2_M3_MAX": NSNumber(value: 1)]
+        } else if paired {
+            options.preprocessorMacros = ["YUE2_PAIRED_LAYOUT": NSNumber(value: 1)]
+        }
         let library = try device.makeLibrary(source: String(contentsOf: source, encoding: .utf8), options: options)
-        func pipeline(_ name: String) throws -> any MTLComputePipelineState {
+        func pipeline(_ name: String, minimumThreads: Int = 128) throws -> any MTLComputePipelineState {
             guard let function = library.makeFunction(name: name) else {
                 throw YuE2Failure.assets("Missing Metal decoder kernel \(name).")
             }
             let pipeline = try device.makeComputePipelineState(function: function)
-            guard pipeline.threadExecutionWidth == 32, pipeline.maxTotalThreadsPerThreadgroup >= 128 else {
+            guard pipeline.threadExecutionWidth == 32, pipeline.maxTotalThreadsPerThreadgroup >= minimumThreads else {
                 throw YuE2Failure.inference("This GPU does not support the Metal decoder layout.")
             }
             return pipeline
         }
-        project = try pipeline(paired ? "project_q4_paired" : "project_q4")
+        project = try pipeline(paired ? "project_q4_paired" : "project_q4", minimumThreads: projectionRows * 32)
+        projectFour = songCount == 2 ? try pipeline("project_q4_four", minimumThreads: projectionRows * 32) : nil
         rms = try pipeline("rms_hidden")
         rotary = try pipeline("rotate_and_append")
         attend = try pipeline("attend_tiles")
@@ -83,6 +96,8 @@ private struct DecoderKernels {
 
 final class MetalDecoder {
     let frames: Int
+    private let songCount: Int
+    private var batch: Int { songCount * 2 }
     private let queue: any MTLCommandQueue
     private let kernels: DecoderKernels
     private let weights: any MTLBuffer
@@ -99,19 +114,34 @@ final class MetalDecoder {
     private let gate: any MTLBuffer
     private let up: any MTLBuffer
     private let tileSummary: any MTLBuffer
-    private let rope: any MTLBuffer
+    private let rotaryTable: any MTLBuffer
     private let logits: any MTLBuffer
 
-    init(assets: ModelAssets, capacity: Int, weightFile: URL? = nil, paired: Bool = false) throws {
+    static var supportsSongPair: Bool {
+        #if os(macOS)
+        MTLCreateSystemDefaultDevice()?.name == "Apple M3 Max"
+            && ProcessInfo.processInfo.physicalMemory >= 32 * 1_024 * 1_024 * 1_024
+        #else
+        false
+        #endif
+    }
+
+    init(assets: ModelAssets, capacity: Int, weightFile: URL? = nil, paired: Bool = false,
+         songCount: Int = 1) throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
             throw YuE2Failure.inference("Metal is unavailable on this device.")
         }
+        guard songCount == 1 || (songCount == 2 && !paired && Self.supportsSongPair) else {
+            throw YuE2Failure.inference("This Metal decoder cannot compose two songs together.")
+        }
         self.queue = queue
+        self.songCount = songCount
+        let batch = songCount * 2
         frames = capacity
         index = try readRecord(MetalWeightIndex.self, at: assets.url("metal-decoder.json"))
         weights = try Self.mapWeights(weightFile ?? assets.url("Autoregressive.mlmodelc/weights/weight.bin"),
                                       index: index, device: device)
-        kernels = try DecoderKernels(device, paired: paired)
+        kernels = try DecoderKernels(device, paired: paired, songCount: songCount)
 
         func buffer(_ count: Int, options: MTLResourceOptions = .storageModePrivate) throws -> any MTLBuffer {
             guard count <= device.maxBufferLength,
@@ -120,21 +150,31 @@ final class MetalDecoder {
             }
             return result
         }
-        let cacheBytes = TensorSpec.layers * 2 * TensorSpec.heads * capacity * TensorSpec.headSize * 2
+        let cacheBytes = TensorSpec.layers * batch * TensorSpec.heads * capacity * TensorSpec.headSize * 2
         keyCache = try buffer(cacheBytes, options: .storageModeShared)
         valueCache = try buffer(cacheBytes, options: .storageModeShared)
-        hidden = try buffer(2 * 2048 * 2, options: .storageModeShared)
-        normalized = try buffer(2 * 2048 * 2)
-        query = try buffer(2 * 2048 * 2)
-        key = try buffer(2 * 1024 * 2)
-        value = try buffer(2 * 1024 * 2)
-        attention = try buffer(2 * 2048 * 2)
-        residual = try buffer(2 * 2048 * 2)
-        gate = try buffer(2 * 6144 * 2)
-        up = try buffer(2 * 6144 * 2)
-        tileSummary = try buffer(32 * ((capacity + 127) / 128) * 130 * 4)
-        rope = try buffer(2 * 128 * 2, options: .storageModeShared)
-        logits = try buffer(2 * TensorSpec.logits * 2, options: .storageModeShared)
+        hidden = try buffer(batch * 2048 * 2, options: .storageModeShared)
+        normalized = try buffer(batch * 2048 * 2)
+        query = try buffer(batch * 2048 * 2)
+        key = try buffer(batch * 1024 * 2)
+        value = try buffer(batch * 1024 * 2)
+        attention = try buffer(batch * 2048 * 2)
+        residual = try buffer(batch * 2048 * 2)
+        gate = try buffer(batch * 6144 * 2)
+        up = try buffer(batch * 6144 * 2)
+        tileSummary = try buffer(songCount * 32 * ((capacity + 127) / 128) * 130 * 4)
+        let rotary = try buffer(capacity * 128 * MemoryLayout<Float16>.stride, options: .storageModeShared)
+        let values = rotary.contents().assumingMemoryBound(to: Float16.self)
+        for position in 0..<capacity {
+            let row = values.advanced(by: position * 128)
+            for (channel, frequency) in ropeFrequencies.enumerated() {
+                let phase = Float(position) * frequency
+                row[channel] = Float16(sinf(phase))
+                row[64 + channel] = Float16(cosf(phase))
+            }
+        }
+        rotaryTable = rotary
+        logits = try buffer(batch * TensorSpec.logits * 2, options: .storageModeShared)
     }
 
     private static func mapWeights(_ url: URL, index: MetalWeightIndex,
@@ -173,31 +213,28 @@ final class MetalDecoder {
 
     func withArray(_ component: CacheComponent, _ body: (MLMultiArray) throws -> Void) throws {
         let buffer = component == .keys ? keyCache : valueCache
-        try body(view(buffer, shape: TensorSpec.cache(batch: 2, frames: frames)))
+        try body(view(buffer, shape: TensorSpec.cache(batch: batch, frames: frames)))
     }
 
-    func predict(embedding: MLMultiArray, sine: MLMultiArray, cosine: MLMultiArray,
-                 positions: [Int]) throws -> any MLFeatureProvider {
-        let input = try view(hidden, shape: [2, 1, TensorSpec.hidden])
-        embedding.transfer(to: input)
-        for (index, array) in [sine, cosine].enumerated() {
-            array.withUnsafeBufferPointer(ofType: Float16.self) { values in
-                let strides = array.strides.map(\.intValue)
-                let dest = rope.contents().assumingMemoryBound(to: Float16.self)
-                for batch in 0..<2 {
-                    for channel in 0..<64 {
-                        dest[batch * 128 + index * 64 + channel] = values[batch * strides[0] + channel * strides[3]]
-                    }
-                }
-            }
+    func predict(embedding: MLMultiArray, positions: [Int], activeSong: Int? = nil) throws -> any MLFeatureProvider {
+        guard activeSong.map({ (0..<songCount).contains($0) }) ?? true,
+              positions.count == batch, positions.allSatisfy({ (0..<frames).contains($0) }) else {
+            throw YuE2Failure.inference("Metal decoder position is outside the cache.")
         }
+        let input = try view(hidden, shape: [batch, 1, TensorSpec.hidden])
+        embedding.transfer(to: input)
 
         guard let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else {
             throw YuE2Failure.inference("Could not schedule Metal decoder inference.")
         }
         command.label = "YuE2 decode token \(positions[0])"
-        let tiles = (max(positions[0], positions[1]) + 128) / 128
-        let layerBytes = 2 * TensorSpec.heads * frames * TensorSpec.headSize * 2
+        let firstSong = activeSong ?? 0
+        let activeSongs = activeSong == nil ? songCount : 1
+        let firstBranch = firstSong * 2
+        let activeBatch = activeSongs * 2
+        let projection = activeSongs == 2 ? (kernels.projectFour ?? kernels.project) : kernels.project
+        let pairCacheBytes = 2 * TensorSpec.heads * frames * TensorSpec.headSize * 2
+        let pairTileBytes = 32 * ((frames + 127) / 128) * 130 * MemoryLayout<Float>.stride
 
         func buffers(_ values: [any MTLBuffer]) {
             for (slot, buffer) in values.enumerated() { encoder.setBuffer(buffer, offset: 0, index: slot) }
@@ -209,81 +246,99 @@ final class MetalDecoder {
         func barrier() { encoder.memoryBarrier(scope: .buffers) }
         func project(_ offset: Int, from input: any MTLBuffer, to output: any MTLBuffer,
                      columns: UInt32 = 2048, rows: UInt32 = 2048) {
-            encoder.setComputePipelineState(kernels.project)
+            encoder.setComputePipelineState(projection)
             let p = index.projections[offset]
             encoder.setBuffer(weights, offset: p.packed, index: 0)
             encoder.setBuffer(weights, offset: p.scale, index: 1)
-            encoder.setBuffer(input, offset: 0, index: 2)
-            encoder.setBuffer(output, offset: 0, index: 3)
+            encoder.setBuffer(input, offset: firstBranch * Int(columns) * 2, index: 2)
+            encoder.setBuffer(output, offset: firstBranch * Int(rows) * 2, index: 3)
             var shape = SIMD2(columns, rows)
             encoder.setBytes(&shape, length: MemoryLayout.size(ofValue: shape), index: 4)
-            groups((Int(rows) + 3) / 4)
+            let rowsPerGroup = kernels.projectionRows
+            groups((Int(rows) + rowsPerGroup - 1) / rowsPerGroup, threads: rowsPerGroup * 32)
         }
         func rms(_ offset: Int) {
             encoder.setComputePipelineState(kernels.rms)
-            encoder.setBuffer(hidden, offset: 0, index: 0)
+            let branchOffset = firstBranch * TensorSpec.hidden * 2
+            encoder.setBuffer(hidden, offset: branchOffset, index: 0)
             encoder.setBuffer(weights, offset: index.norms[offset], index: 1)
-            encoder.setBuffer(normalized, offset: 0, index: 2)
+            encoder.setBuffer(normalized, offset: branchOffset, index: 2)
             var width: UInt32 = 2048
             encoder.setBytes(&width, length: 4, index: 3)
-            groups(2)
+            groups(activeBatch)
             barrier()
         }
-        func combine(_ kernel: any MTLComputePipelineState, first: any MTLBuffer, second: any MTLBuffer, count: Int) {
+        func combine(_ kernel: any MTLComputePipelineState, first: any MTLBuffer, second: any MTLBuffer, width: Int) {
             encoder.setComputePipelineState(kernel)
-            buffers([first, second])
-            groups(count / 128)
+            let offset = firstBranch * width * 2
+            encoder.setBuffer(first, offset: offset, index: 0)
+            encoder.setBuffer(second, offset: offset, index: 1)
+            groups(activeBatch * width / 128)
             barrier()
         }
 
         for layer in 0..<TensorSpec.layers {
             let n = layer * 4, p = layer * 7
-            let cacheOffset = layer * layerBytes
+            let layerOffset = layer * songCount * pairCacheBytes
             rms(n)
             project(p, from: normalized, to: query)
             project(p + 1, from: normalized, to: key, rows: 1024)
             project(p + 2, from: normalized, to: value, rows: 1024)
             barrier()
 
-            encoder.setComputePipelineState(kernels.rotary)
-            buffers([query, key, value])
-            encoder.setBuffer(keyCache, offset: cacheOffset, index: 3)
-            encoder.setBuffer(valueCache, offset: cacheOffset, index: 4)
-            encoder.setBuffer(weights, offset: index.norms[n + 1], index: 5)
-            encoder.setBuffer(weights, offset: index.norms[n + 2], index: 6)
-            encoder.setBuffer(rope, offset: 0, index: 7)
-            var context = SIMD4(UInt32(positions[0]), UInt32(positions[1]), UInt32(frames), UInt32(tiles))
-            encoder.setBytes(&context, length: MemoryLayout.size(ofValue: context), index: 8)
-            groups(24, 2, threads: 32)
-            barrier()
+            // Keep each song's attention dispatch and reductions identical to the single-song path.
+            for song in firstSong..<(firstSong + activeSongs) {
+                let batchStart = song * 2
+                let queryOffset = batchStart * 2048 * 2
+                let keyOffset = batchStart * 1024 * 2
+                let cacheOffset = layerOffset + song * pairCacheBytes
+                let summaryOffset = song * pairTileBytes
+                let tiles = (max(positions[batchStart], positions[batchStart + 1]) + 128) / 128
+                var context = SIMD4(UInt32(positions[batchStart]), UInt32(positions[batchStart + 1]),
+                                    UInt32(frames), UInt32(tiles))
 
-            encoder.setComputePipelineState(kernels.attend)
-            encoder.setBuffer(query, offset: 0, index: 0)
-            encoder.setBuffer(keyCache, offset: cacheOffset, index: 1)
-            encoder.setBuffer(valueCache, offset: cacheOffset, index: 2)
-            encoder.setBuffer(tileSummary, offset: 0, index: 3)
-            encoder.setBytes(&context, length: MemoryLayout.size(ofValue: context), index: 4)
-            groups(16, tiles)
-            barrier()
+                encoder.setComputePipelineState(kernels.rotary)
+                encoder.setBuffer(query, offset: queryOffset, index: 0)
+                encoder.setBuffer(key, offset: keyOffset, index: 1)
+                encoder.setBuffer(value, offset: keyOffset, index: 2)
+                encoder.setBuffer(keyCache, offset: cacheOffset, index: 3)
+                encoder.setBuffer(valueCache, offset: cacheOffset, index: 4)
+                encoder.setBuffer(weights, offset: index.norms[n + 1], index: 5)
+                encoder.setBuffer(weights, offset: index.norms[n + 2], index: 6)
+                encoder.setBuffer(rotaryTable, offset: 0, index: 7)
+                encoder.setBytes(&context, length: MemoryLayout.size(ofValue: context), index: 8)
+                groups(24, 2, threads: 32)
+                barrier()
 
-            encoder.setComputePipelineState(kernels.reduce)
-            buffers([tileSummary, attention])
-            var count = UInt32(tiles)
-            encoder.setBytes(&count, length: 4, index: 2)
-            groups(32)
-            barrier()
+                encoder.setComputePipelineState(kernels.attend)
+                encoder.setBuffer(query, offset: queryOffset, index: 0)
+                encoder.setBuffer(keyCache, offset: cacheOffset, index: 1)
+                encoder.setBuffer(valueCache, offset: cacheOffset, index: 2)
+                encoder.setBuffer(tileSummary, offset: summaryOffset, index: 3)
+                encoder.setBytes(&context, length: MemoryLayout.size(ofValue: context), index: 4)
+                groups(16, tiles)
+                barrier()
+
+                encoder.setComputePipelineState(kernels.reduce)
+                encoder.setBuffer(tileSummary, offset: summaryOffset, index: 0)
+                encoder.setBuffer(attention, offset: queryOffset, index: 1)
+                var count = UInt32(tiles)
+                encoder.setBytes(&count, length: MemoryLayout.size(ofValue: count), index: 2)
+                groups(32)
+                barrier()
+            }
             project(p + 3, from: attention, to: residual)
             barrier()
-            combine(kernels.residual, first: hidden, second: residual, count: 2 * 2048)
+            combine(kernels.residual, first: hidden, second: residual, width: 2048)
 
             rms(n + 3)
             project(p + 4, from: normalized, to: gate, rows: 6144)
             project(p + 5, from: normalized, to: up, rows: 6144)
             barrier()
-            combine(kernels.gate, first: gate, second: up, count: 2 * 6144)
+            combine(kernels.gate, first: gate, second: up, width: 6144)
             project(p + 6, from: gate, to: residual, columns: 6144)
             barrier()
-            combine(kernels.residual, first: hidden, second: residual, count: 2 * 2048)
+            combine(kernels.residual, first: hidden, second: residual, width: 2048)
         }
 
         rms(index.norms.count - 1)
@@ -294,6 +349,6 @@ final class MetalDecoder {
         guard command.status == .completed else {
             throw YuE2Failure.inference(command.error?.localizedDescription ?? "Metal decoder command failed.")
         }
-        return try provider(["logits": view(logits, shape: [2, 1, TensorSpec.logits])])
+        return try provider(["logits": view(logits, shape: [batch, 1, TensorSpec.logits])])
     }
 }

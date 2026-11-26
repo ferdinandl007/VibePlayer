@@ -5,6 +5,11 @@ constant uint heads = 8;
 constant uint headWidth = 128;
 constant uint tileFrames = 128;
 constant float hiddenScore = -1.0e20f;
+#ifdef YUE2_M3_MAX
+constant uint projectionRows = 8;
+#else
+constant uint projectionRows = 4;
+#endif
 
 // One simdgroup computes a weight row for both guidance branches.
 kernel void project_q4(device const ushort *weights [[buffer(0)]],
@@ -15,13 +20,13 @@ kernel void project_q4(device const ushort *weights [[buffer(0)]],
                        uint group [[threadgroup_position_in_grid]],
                        ushort lane [[thread_index_in_simdgroup]],
                        ushort simd [[simdgroup_index_in_threadgroup]]) {
-    uint row = group * 4 + simd;
+    uint row = group * projectionRows + simd;
     if (row >= shape.y) return;
     uint columns = shape.x / 4;
     const device ushort *packed = weights + row * columns;
     const device half *scale = scales + row * (columns / 8);
     float sum0 = 0, sum1 = 0;
-#ifdef YUE2_PAIRED_LAYOUT
+#if defined(YUE2_PAIRED_LAYOUT) || defined(YUE2_M3_MAX)
     #pragma clang loop unroll_count(4)
 #endif
     for (uint i = lane; i < columns; i += 32) {
@@ -37,6 +42,46 @@ kernel void project_q4(device const ushort *weights [[buffer(0)]],
     if (lane == 0) {
         output[row] = half(sum0);
         output[shape.y + row] = half(sum1);
+    }
+}
+
+// Two songs share each weight read, keeping each guidance branch's reduction order.
+kernel void project_q4_four(device const ushort *weights [[buffer(0)]],
+                       device const half *scales [[buffer(1)]],
+                       device const half4 *input [[buffer(2)]],
+                       device half *output [[buffer(3)]],
+                       constant uint2 &shape [[buffer(4)]],
+                       uint group [[threadgroup_position_in_grid]],
+                       ushort lane [[thread_index_in_simdgroup]],
+                       ushort simd [[simdgroup_index_in_threadgroup]]) {
+    uint row = group * projectionRows + simd;
+    if (row >= shape.y) return;
+    uint columns = shape.x / 4;
+    const device ushort *packed = weights + row * columns;
+    const device half *scale = scales + row * (columns / 8);
+    float sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+#if defined(YUE2_PAIRED_LAYOUT) || defined(YUE2_M3_MAX)
+    #pragma clang loop unroll_count(4)
+#endif
+    for (uint i = lane; i < columns; i += 32) {
+        ushort word = packed[i];
+        short4 n = short4(word & 15, (word >> 4) & 15, (word >> 8) & 15, word >> 12);
+        float4 q = float4((n ^ 8) - 8);
+        float s = float(scale[i / 8]);
+        sum0 += s * dot(q, float4(input[i]));
+        sum1 += s * dot(q, float4(input[columns + i]));
+        sum2 += s * dot(q, float4(input[2 * columns + i]));
+        sum3 += s * dot(q, float4(input[3 * columns + i]));
+    }
+    sum0 = simd_sum(sum0);
+    sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2);
+    sum3 = simd_sum(sum3);
+    if (lane == 0) {
+        output[row] = half(sum0);
+        output[shape.y + row] = half(sum1);
+        output[2 * shape.y + row] = half(sum2);
+        output[3 * shape.y + row] = half(sum3);
     }
 }
 
@@ -128,8 +173,8 @@ kernel void rotate_and_append(device half *query [[buffer(0)]],
         uint high = d + 64;
         float left = float(x[d]) * inv * float(weights[d]);
         float right = float(x[high]) * inv * float(weights[high]);
-        float s = float(rope[batch * 128 + d]);
-        float c = float(rope[batch * 128 + high]);
+        float s = float(rope[cursor * 128 + d]);
+        float c = float(rope[cursor * 128 + high]);
         if (isQuery) {
             query[source + d] = half(left * c - right * s);
             query[source + high] = half(right * c + left * s);
@@ -162,7 +207,7 @@ kernel void attend_tiles(device const half *query [[buffer(0)]],
     float4 q1 = float4(query[q], query[q + 32], query[q + 64], query[q + 96]);
     threadgroup float2 scores[tileFrames];
     threadgroup float2 parts[4];
-#ifdef YUE2_PAIRED_LAYOUT
+#if defined(YUE2_PAIRED_LAYOUT) || defined(YUE2_M3_MAX)
     #pragma clang loop unroll_count(4)
 #endif
     for (uint frame = simd; frame < tileFrames; frame += 4) {
@@ -186,7 +231,7 @@ kernel void attend_tiles(device const half *query [[buffer(0)]],
     if (lane == 0) parts[simd] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float2 result = float2(0);
-#ifdef YUE2_PAIRED_LAYOUT
+#if defined(YUE2_PAIRED_LAYOUT) || defined(YUE2_M3_MAX)
     #pragma clang loop unroll_count(8)
 #endif
     for (uint frame = 0; frame < localCount; ++frame) {

@@ -10,22 +10,25 @@ public enum AcousticProfile: String, Codable, Sendable {
     case streaming
 }
 
-public struct SongRequest: Codable, Sendable {
+public struct SongRequest: Codable, Equatable, Sendable {
     public var lyrics: String
     public var style: String
     public var seed: UInt64
     public var maximumFrames: Int?
     public var acousticProfile: AcousticProfile?
     public var minimumFrames: Int
+    /// An opening to keep, expressed as zero-based semantic codec indices.
+    public var semanticPrefix: [Int]?
 
     public init(lyrics: String, style: String, seed: UInt64, maximumFrames: Int? = nil,
-                minimumFrames: Int = 200, acousticProfile: AcousticProfile? = nil) {
+                minimumFrames: Int = 200, acousticProfile: AcousticProfile? = nil, semanticPrefix: [Int]? = nil) {
         self.acousticProfile = acousticProfile
         self.lyrics = lyrics
         self.style = style
         self.seed = seed
         self.maximumFrames = maximumFrames
         self.minimumFrames = minimumFrames
+        self.semanticPrefix = semanticPrefix
     }
 }
 
@@ -49,6 +52,12 @@ public struct SongResult: Codable, Sendable {
     public let acousticSeconds: Double
     public let waveformSeconds: Double
     public var duration: Double { Double(sampleFrames) / Double(sampleRate) }
+}
+
+public struct SongDraft: Sendable {
+    /// Semantic codec indices without the end token, at 25 frames per second.
+    public let codecTokens: [Int]
+    public let naturalEnding: Bool
 }
 
 public struct SongPromptUsage: Sendable {
@@ -92,6 +101,14 @@ public final class YuE2Renderer: Sendable {
     let assets: ModelAssets
     let execution: Execution
     private let pairedWeights: URL?
+    #if os(macOS)
+    private let promptCache = Decoder.PromptCache()
+    #endif
+
+    public var supportsSongPair: Bool {
+        if case .metal = execution { return MetalDecoder.supportsSongPair }
+        return false
+    }
 
     private var usesMetal: Bool {
         switch execution {
@@ -127,6 +144,61 @@ public final class YuE2Renderer: Sendable {
         if case .metalPaired = execution { self.pairedWeights = try PairedWeights.verifiedFile(in: assets) }
         else { self.pairedWeights = nil }
         self.execution = execution
+    }
+
+    /// Composes with the Metal decoder and returns the complete semantic sequence in memory.
+    @concurrent
+    public func compose(_ request: SongRequest,
+                        onProgress: @escaping @Sendable (SongProgress) -> Void = { _ in }) async throws -> SongDraft {
+        try Task.checkCancellation()
+        guard usesMetal else { throw YuE2Failure.request("Song composition requires the Metal decoder.") }
+        guard active.withLock({ value in
+            if value { return false }
+            value = true
+            return true
+        }) else { throw YuE2Failure.request("This renderer already has an active song.") }
+        defer { active.withLock { $0 = false } }
+
+        let stage = try compositionStage(request)
+        #if os(macOS)
+        let decoder = Decoder(assets: assets, pairedWeights: pairedWeights, promptCache: promptCache)
+        #else
+        let decoder = Decoder(assets: assets, pairedWeights: pairedWeights)
+        #endif
+        guard let draft = try await decoder.run(stage, progress: onProgress) else {
+            throw YuE2Failure.inference("Missing semantic tokens.")
+        }
+        return draft
+    }
+
+    /// Shares each projection weight read across two independent songs on supported Macs.
+    @concurrent
+    public func composePair(_ first: SongRequest, _ second: SongRequest,
+                            onProgress: @escaping @Sendable (Int, SongProgress) -> Void = { _, _ in }) async throws
+        -> (SongDraft, SongDraft) {
+        #if os(macOS)
+        try Task.checkCancellation()
+        guard supportsSongPair else { throw YuE2Failure.request("Two-song Metal composition is unavailable.") }
+        guard active.withLock({ value in
+            if value { return false }
+            value = true
+            return true
+        }) else { throw YuE2Failure.request("This renderer already has an active song.") }
+        defer { active.withLock { $0 = false } }
+        let stages = try [compositionStage(first), compositionStage(second)]
+        let drafts = try Decoder(assets: assets, promptCache: promptCache).runPair(stages, progress: onProgress)
+        return (drafts[0], drafts[1])
+        #else
+        throw YuE2Failure.request("Two-song Metal composition is unavailable.")
+        #endif
+    }
+
+    private func compositionStage(_ request: SongRequest) throws -> Stage {
+        let limit = try assets.limits(for: request, useMetal: true)
+        guard let capacity = assets.decoderCapacities(useMetal: true).first(where: { $0 >= limit }) else {
+            throw YuE2Failure.assets("The requested song length requires a larger decoder.")
+        }
+        return Stage(request: request, limit: limit, capacity: capacity, index: 0, isAcoustic: false, useMetal: true)
     }
 
     /// Creates a stereo 48 kHz PCM16 WAV. Existing output survives cancellation or a failed render.
@@ -354,6 +426,11 @@ struct ModelAssets: Sendable {
               request.lyrics.utf8.count + request.style.utf8.count <= 32768 else {
             throw YuE2Failure.request("Check the style, input length, and frame limits for this asset bundle.")
         }
+        if let prefix = request.semanticPrefix, !prefix.isEmpty {
+            guard prefix.count < limit, prefix.allSatisfy({ (0..<32768).contains($0) }) else {
+                throw YuE2Failure.request("The reference needs valid semantic codes and room for new music.")
+            }
+        }
         return limit
     }
 
@@ -370,6 +447,11 @@ struct ModelAssets: Sendable {
     func load(_ name: String) throws -> MLModel {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .cpuAndGPU
+        #if os(iOS)
+        // MPSGraph can abort the process allocating Prefill's GPU heap on iPhone.
+        // Prefill runs once per song. The Metal token decoder and acoustic graphs stay on the GPU.
+        if name == "Prefill" { configuration.computeUnits = .cpuOnly }
+        #endif
         if manifest.version >= 2, name == "Prefill" || name == "GrowableDecoder" || name.hasPrefix("Decoder") {
             configuration.functionName = name
             return try MLModel(contentsOf: url("Autoregressive.mlmodelc"), configuration: configuration)

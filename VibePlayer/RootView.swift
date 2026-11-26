@@ -9,6 +9,7 @@ struct RootView: View {
     @State private var showImporter = false
     @State private var showNewStation = false
     @State private var newStationName = ""
+    @State private var preparingRemix = false
 
     var body: some View {
         platformNavigation
@@ -155,7 +156,19 @@ struct RootView: View {
                                         Spacer()
                                     }.contentShape(Rectangle())
                                 }.buttonStyle(.plain)
-                                Menu { Button("Delete song", role: .destructive) { player.deleteSavedSong(song) } } label: {
+                                Menu {
+                                    if song.semanticFilename != nil || MusicReference.canEncodeAudio {
+                                        Button(preparingRemix ? "Preparing reference…" : "Remix in Create", systemImage: "waveform.path") {
+                                            preparingRemix = true
+                                            Task {
+                                                defer { preparingRemix = false }
+                                                do { try await player.remix(song); tab = 2 }
+                                                catch { player.errorMessage = error.localizedDescription }
+                                            }
+                                        }.disabled(preparingRemix)
+                                    }
+                                    Button("Delete song", role: .destructive) { player.deleteSavedSong(song) }
+                                } label: {
                                     Image(systemName: "ellipsis").frame(width: 44, height: 44)
                                 }.accessibilityLabel("Song options")
                             }
