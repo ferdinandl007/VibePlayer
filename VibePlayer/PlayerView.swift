@@ -5,13 +5,17 @@ import AppKit
 #endif
 
 struct PlayerView: View {
+    private enum SoundEditor: Identifiable {
+        case genres, voice
+        var id: Self { self }
+    }
+
     @Environment(PlayerStore.self) private var player
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     var close: (() -> Void)? = nil
     @ScaledMetric(relativeTo: .subheadline) private var tempoWidth: CGFloat = 122
-    @State private var editingTags = false
-    @State private var editingVoice = false
+    @State private var soundEditor: SoundEditor?
     @State private var showImporter = false
     @State private var showFullQueue = false
     @State private var radioScrubPosition: Double?
@@ -67,7 +71,7 @@ struct PlayerView: View {
             catch { return }
             if soundChangeToShow == id { soundChangeToShow = nil }
         }
-        .sheet(isPresented: $editingTags) { TagEditor(showVoice: editingVoice) }
+        .sheet(item: $soundEditor) { editor in TagEditor(showVoice: editor == .voice) }
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.audio]) { result in
             switch result {
             case .success(let url): player.load(url: url, name: url.deletingPathExtension().lastPathComponent)
@@ -179,13 +183,13 @@ struct PlayerView: View {
             SoundControl(name: player.selected.tempo < 90 ? "Slow" : player.selected.tempo < 130 ? "Medium" : "Fast", symbol: "speedometer", value: (player.selected.tempo - 50) / 130, valueText: "\(Int(player.selected.tempo)) beats per minute", fixedWidth: tempoWidth) { value, commit in
                 player.setTempo(50 + value * 130, commit: commit)
             }.accessibilityIdentifier("tempo-control")
-            Button { editingVoice = true; editingTags = true } label: {
+            Button { soundEditor = .voice } label: {
                 Label(language ?? "Language", systemImage: "globe")
                     .font(.subheadline.weight(.semibold)).padding(.horizontal, 16).frame(height: 44).vibeGlass()
             }.buttonStyle(.plain)
                 .accessibilityLabel("Song language").accessibilityValue(language ?? "Automatic")
                 .accessibilityIdentifier("radio-language")
-            Button { editingVoice = false; editingTags = true } label: {
+            Button { soundEditor = .genres } label: {
                 Label("Add", systemImage: "plus").font(.subheadline.weight(.semibold)).padding(.horizontal, 16).frame(height: 44).vibeGlass()
             }.buttonStyle(.plain)
         }
