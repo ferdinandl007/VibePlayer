@@ -1476,7 +1476,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         #if os(macOS)
         let keepPlaying = radioMode && (radioWantsPlayback || (isGenerating && !isCreating))
         if keepPlaying, radioActivity == nil {
-            radioActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Vibe Player Radio")
+            radioActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "infetit radio")
         } else if !keepPlaying, let activity = radioActivity {
             ProcessInfo.processInfo.endActivity(activity)
             radioActivity = nil
@@ -1489,7 +1489,7 @@ final class PlayerStore: NSObject, AVAudioPlayerDelegate {
         commands.changePlaybackPositionCommand.isEnabled = canSeek
         MPNowPlayingInfoCenter.default().nowPlayingInfo = [
             MPMediaItemPropertyTitle: trackName,
-            MPMediaItemPropertyArtist: radioMode ? (currentTrack?.request.stationName ?? selected.name) : (trackArtist ?? "Vibe Player"),
+            MPMediaItemPropertyArtist: radioMode ? (currentTrack?.request.stationName ?? selected.name) : (trackArtist ?? "infetit radio"),
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying && !isBufferingPreview ? 1.0 : 0.0

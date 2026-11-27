@@ -36,7 +36,7 @@ struct RootView: View {
             }
         }
         .onAppear { if ProcessInfo.processInfo.arguments.contains("--preview-playing") { player.play() } }
-        .alert("Vibe Player", isPresented: Binding(get: { player.errorMessage != nil }, set: { if !$0 { player.errorMessage = nil } })) {
+        .alert("infetit radio", isPresented: Binding(get: { player.errorMessage != nil }, set: { if !$0 { player.errorMessage = nil } })) {
             Button("OK", role: .cancel) { player.errorMessage = nil }
         } message: { Text(player.errorMessage ?? "") }
     }
@@ -67,7 +67,7 @@ struct RootView: View {
                 Label("Library", systemImage: "square.stack.3d.up").tag(1)
             }
             .listStyle(.sidebar)
-            .navigationTitle("Vibe Player")
+            .navigationTitle("infetit radio")
             .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
         } detail: {
             if showPlayer {

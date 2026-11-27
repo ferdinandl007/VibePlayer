@@ -1,19 +1,19 @@
-# Vibe Player
+# infetit radio
 
 **An open-source AI music player and generative radio for iPhone, iPad, and Mac.** Describe a song or shape a station, then make music locally with YuE2, SwiftUI, Core ML, and Metal.
 
-Vibe Player is an experimental native app for exploring what a music player feels like when you can change the music itself. Choose a mood, adjust the instruments, and let Radio prepare the next track—or start with your own idea and lyrics.
+infetit radio is an experimental native app for exploring what a music player feels like when you can change the music itself. Choose a mood, adjust the instruments, and let Radio prepare the next track—or start with your own idea and lyrics.
 
 <p align="center">
-  <img src="Screenshots/radio.png" alt="Vibe Player Radio showing a selection of music stations" width="30%" />
+  <img src="Screenshots/radio.png" alt="infetit radio showing a selection of music stations" width="30%" />
   &nbsp;
-  <img src="Screenshots/player.png" alt="Vibe Player's full-screen player with adjustable sound controls" width="30%" />
+  <img src="Screenshots/player.png" alt="infetit radio's full-screen player with adjustable sound controls" width="30%" />
   &nbsp;
-  <img src="Screenshots/sounds.png" alt="Vibe Player sound editor for shaping a station" width="30%" />
+  <img src="Screenshots/sounds.png" alt="infetit radio sound editor for shaping a station" width="30%" />
 </p>
 <p align="center"><em>Pick a station. Shape the sound. Hear what comes next.</em></p>
 
-> **Early prototype:** Use [Quick install](#quick-install) to build Vibe Player and download the models for local music generation.
+> **Early prototype:** Use [Quick install](#quick-install) to build infetit radio and download the models for local music generation.
 
 ## What you can do
 
@@ -28,7 +28,7 @@ The station controls describe the sound in a prompt. They are creative cues, not
 ## See it on iPad
 
 <p align="center">
-  <img src="Screenshots/wide-player.png" alt="Vibe Player's player on an iPad-sized screen" width="68%" />
+  <img src="Screenshots/wide-player.png" alt="infetit radio's player on an iPad-sized screen" width="68%" />
 </p>
 
 These screenshots show an earlier prototype using sample audio. The current generation features require model setup described below.
@@ -49,7 +49,7 @@ From a clone of this repository on an Apple silicon Mac with Xcode installed:
 python3 Scripts/install_models.py --build-app
 ```
 
-This installs Vibe Player in `~/Applications` and downloads the Mac music and songwriting models. Use `python3 Scripts/install_models.py` to install the models for an existing build. Add `--all` for the optional full-precision and reference-audio weights.
+This installs infetit radio in `~/Applications` and downloads the Mac music and songwriting models. Use `python3 Scripts/install_models.py` to install the models for an existing build. Add `--all` for the optional full-precision and reference-audio weights.
 
 For iPhone or iPad, run the project once from Xcode using your signing team. Close the app on the device, and run this from the Mac:
 
@@ -60,7 +60,7 @@ python3 Scripts/install_models.py --device YOUR_DEVICE_ID
 
 Pass `--bundle-id YOUR_BUNDLE_ID` if you changed the bundle identifier for signing. Reopen the app after the models finish copying. The command installs the platform-appropriate models. See the runtime instructions below to enable the optional native Metal renderer.
 
-The installer verifies SHA-256 hashes and downloads from pinned Hugging Face revisions. The [Vibe Player Core ML repository](https://huggingface.co/ferdinandl007/vibeplayer-yue2-coreml) supplies the compiled bundles. The original publishers supply the GGUF and LFM3 weights. The music and reference weights are under CC BY-NC 4.0, and LFM3 uses the [LFM Open License](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit).
+The installer verifies SHA-256 hashes and downloads from pinned Hugging Face revisions. The [infetit radio Core ML repository](https://huggingface.co/ferdinandl007/vibeplayer-yue2-coreml) supplies the compiled bundles. The original publishers supply the GGUF and LFM3 weights. The music and reference weights are under CC BY-NC 4.0, and LFM3 uses the [LFM Open License](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit).
 
 ### Build the app
 
@@ -130,4 +130,4 @@ Issues, ideas, and pull requests are welcome. If you encounter a generation prob
 
 ## License
 
-Vibe Player is available under the [MIT License](LICENSE). Third-party components have their own terms: YuE2Kit includes an audio.cpp ABI header under the [Apache License 2.0](Packages/YuE2Kit/LICENSE.audio.cpp), and the separately obtained [YuE2 weights](https://huggingface.co/m-a-p/YuE2-3B) are licensed under CC BY-NC 4.0.
+infetit radio is available under the [MIT License](LICENSE). Third-party components have their own terms: YuE2Kit includes an audio.cpp ABI header under the [Apache License 2.0](Packages/YuE2Kit/LICENSE.audio.cpp), and the separately obtained [YuE2 weights](https://huggingface.co/m-a-p/YuE2-3B) are licensed under CC BY-NC 4.0.

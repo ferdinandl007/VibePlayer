@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the pinned Vibe Player models on an Apple silicon Mac or a paired iPhone/iPad."""
+"""Install the pinned infetit radio models on an Apple silicon Mac or a paired iPhone/iPad."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -115,9 +115,9 @@ def build_mac():
          "-derivedDataPath", str(derived), "ARCHS=arm64", "ONLY_ACTIVE_ARCH=YES", "CODE_SIGN_IDENTITY=-", "build"],
         check=True
     )
-    app = derived / "Build/Products/Release/Vibe Player.app"
+    app = derived / "Build/Products/Release/infetit radio.app"
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
-    install_directory(app, Path.home() / "Applications/Vibe Player.app")
+    install_directory(app, Path.home() / "Applications/infetit radio.app")
 
 
 def install(lock, args):
@@ -140,13 +140,13 @@ def install(lock, args):
         provision(args.device, args.bundle_id, root)
     elif args.build_app:
         build_mac()
-    print("Vibe Player models are installed.")
+    print("infetit radio models are installed.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     options = parser.add_mutually_exclusive_group()
-    options.add_argument("--device", help="Provision an iPhone or iPad where Vibe Player has already been run from Xcode.")
+    options.add_argument("--device", help="Provision an iPhone or iPad where infetit radio has already been run from Xcode.")
     options.add_argument("--build-app", action="store_true", help="Also build and install the Mac app in ~/Applications.")
     parser.add_argument("--all", action="store_true", help="Include full-precision and reference audio weights on Mac.")
     parser.add_argument("--bundle-id", default="com.vibeplayer.app", help="Bundle ID used to sign the iPhone or iPad build.")
@@ -170,4 +170,4 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
-        sys.exit(f"Vibe Player setup: {error}")
+        sys.exit(f"infetit radio setup: {error}")

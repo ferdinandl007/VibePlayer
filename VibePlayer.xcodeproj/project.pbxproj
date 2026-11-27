@@ -45,7 +45,7 @@
 		4B866E742A671517FBE42F0C /* Assets.xcassets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		4E82CAECF6560176D3875E74 /* Editors.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = Editors.swift; sourceTree = "<group>"; };
 		52428ED6801AC2EA5C8CB85A /* RootView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
-		995B67FBC5C8484CD611CFD4 /* VibePlayer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VibePlayer.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		995B67FBC5C8484CD611CFD4 /* infetit radio.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "infetit radio.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		B226ED7E38C6D07A01018361 /* VibePlayerUITests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VibePlayerUITests.swift; sourceTree = "<group>"; };
 		C0FE7819D74EA835C58EE19C /* CreateSongView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CreateSongView.swift; sourceTree = "<group>"; };
 		E70F0473C0BBD0438CCE1D7A /* VibePlayerUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VibePlayerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -129,7 +129,7 @@
 		CEE92837695B15E2A21781B9 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				995B67FBC5C8484CD611CFD4 /* VibePlayer.app */,
+				995B67FBC5C8484CD611CFD4 /* infetit radio.app */,
 				E70F0473C0BBD0438CCE1D7A /* VibePlayerUITests.xctest */,
 			);
 			name = Products;
@@ -190,7 +190,7 @@
 			name = VibePlayer;
             packageProductDependencies = (AEE200000000000000000004 /* YuE2CoreML */, AEE200000000000000000007 /* YuE2Kit */,);
 			productName = VibePlayer;
-			productReference = 995B67FBC5C8484CD611CFD4 /* VibePlayer.app */;
+			productReference = 995B67FBC5C8484CD611CFD4 /* infetit radio.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -382,11 +382,12 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_FILE[sdk=iphoneos*]" = VibePlayer/Info.plist;
 				"INFOPLIST_FILE[sdk=iphonesimulator*]" = VibePlayer/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "infetit radio";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vibeplayer.app;
-				PRODUCT_NAME = "Vibe Player";
+				PRODUCT_NAME = "infetit radio";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				MACOSX_DEPLOYMENT_TARGET = 15.0;
@@ -481,11 +482,12 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				"INFOPLIST_FILE[sdk=iphoneos*]" = VibePlayer/Info.plist;
 				"INFOPLIST_FILE[sdk=iphonesimulator*]" = VibePlayer/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "infetit radio";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vibeplayer.app;
-				PRODUCT_NAME = "Vibe Player";
+				PRODUCT_NAME = "infetit radio";
 				SDKROOT = auto;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
 				MACOSX_DEPLOYMENT_TARGET = 15.0;

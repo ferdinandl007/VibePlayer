@@ -26,9 +26,9 @@ For experimental low-latency playback, load with `mode: .streamingPreview` and c
 
 Progressive playback re-renders the prefix at each checkpoint. The default schedule is for short previews. Use measured buffer lead and a playback clock to decide when to start a rhythm game and whether to extend the schedule. This package targets macOS. The supplied dylib is a macOS binary.
 
-## Full-context playback in Vibe Player
+## Full-context playback in infetit radio
 
-On Apple silicon, Create's **High quality** mode can compose with Vibe Player's Metal shaders and pass the complete token sequence to audio.cpp for a single eight-step acoustic pass. An optional PCM callback hands off each finalized waveform tile as it decodes. The player queues those same samples into the saved WAV.
+On Apple silicon, Create's **High quality** mode can compose with infetit radio's Metal shaders and pass the complete token sequence to audio.cpp for a single eight-step acoustic pass. An optional PCM callback hands off each finalized waveform tile as it decodes. The player queues those same samples into the saved WAV.
 
 Build the experimental PCM runtime from the pinned audio.cpp release using CMake and the Xcode Metal toolchain. Run these commands from `Packages/YuE2Kit`:
 
@@ -45,7 +45,7 @@ cmake -S "$work/audio.cpp" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
 cmake --build "$work/build" --parallel 8 --target audiocpp
 ```
 
-Copy the compiled library (following the symlink from `$work/build/bin/libaudiocpp.dylib`) to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm.dylib`. Vibe Player also needs its indexed `YuE2MetalAssets` bundle for composing. The optional library enables the hybrid route for High quality and long Radio songs when it exports the waveform callback. The current patch also exports `audiocpp_yue2_session_run_observed` for live synthesis step counts and cancellation between steps. Rebuild older PCM runtimes to enable those updates. Audio begins after composition and full-song acoustic synthesis, during waveform decoding.
+Copy the compiled library (following the symlink from `$work/build/bin/libaudiocpp.dylib`) to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm.dylib`. infetit radio also needs its indexed `YuE2MetalAssets` bundle for composing. The optional library enables the hybrid route for High quality and long Radio songs when it exports the waveform callback. The current patch also exports `audiocpp_yue2_session_run_observed` for live synthesis step counts and cancellation between steps. Rebuild older PCM runtimes to enable those updates. Audio begins after composition and full-song acoustic synthesis, during waveform decoding.
 
 To enable the faster **High Quality** and Radio runtime on Mac, build a second copy of the PCM runtime with `Patches/audio-cpp-v0.9.6-wide-attention.patch` also applied. Copy the fast build to `~/Library/Application Support/YuE2NativeAssets/libaudiocpp-pcm-fast.dylib`, set its install name to `@rpath/libaudiocpp-pcm-fast.dylib` with `install_name_tool -id`, and re-sign it with `codesign --force --sign -`. It uses the same eight midpoint steps and full song context. Keep the standard PCM library available for fallback.
 
@@ -59,7 +59,7 @@ From the repository root, build the arm64 iOS 18+ framework with Xcode's device 
 bash Packages/YuE2Kit/Scripts/build-ios-runtime.sh
 ```
 
-Vibe Player embeds and signs the generated `Packages/YuE2Kit/.build/apple-mobile/YuE2Audio.framework` when building for `iphoneos`. Provision both `YuE2MetalAssets` and `YuE2NativeAssets` in the app's Application Support directory or app resources. The native directory contains `yue2.json` from audio.cpp v0.9.6 and the `weights` subdirectory described above. The indexed bundle supplies token composition, and the native bundle supplies acoustic synthesis and waveform decoding.
+infetit radio embeds and signs the generated `Packages/YuE2Kit/.build/apple-mobile/YuE2Audio.framework` when building for `iphoneos`. Provision both `YuE2MetalAssets` and `YuE2NativeAssets` in the app's Application Support directory or app resources. The native directory contains `yue2.json` from audio.cpp v0.9.6 and the `weights` subdirectory described above. The indexed bundle supplies token composition, and the native bundle supplies acoustic synthesis and waveform decoding.
 
 High Quality and Radio select the embedded renderer when both bundles are available. After composition, the renderer loads the native session, runs eight midpoint steps with the whole song in context and emits PCM while decoding the waveform. The app releases that session before composing the next song. The current iOS song cap still applies, and an explicit Early Playback choice continues to use the windowed pipeline. Simulator builds and installations without the framework or native weights use the indexed renderer.
 

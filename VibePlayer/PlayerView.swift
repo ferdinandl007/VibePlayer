@@ -78,7 +78,7 @@ struct PlayerView: View {
             case .failure: player.errorMessage = "Couldn't import this audio file. Please try again."
             }
         }
-        .alert("Vibe Player", isPresented: Binding(get: { player.errorMessage != nil }, set: { if !$0 { player.errorMessage = nil } })) { Button("OK", role: .cancel) { player.errorMessage = nil } } message: { Text(player.errorMessage ?? "") }
+        .alert("infetit radio", isPresented: Binding(get: { player.errorMessage != nil }, set: { if !$0 { player.errorMessage = nil } })) { Button("OK", role: .cancel) { player.errorMessage = nil } } message: { Text(player.errorMessage ?? "") }
     }
     private var scrollMarker: some View {
         GeometryReader { proxy in

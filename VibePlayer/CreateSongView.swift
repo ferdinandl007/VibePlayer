@@ -760,7 +760,7 @@ private struct SongwritingSettings: View {
                 } header: {
                     Text("Gemini API key")
                 } footer: {
-                    Text("With a key, Vibe Player sends songwriting requests to Gemini. Apple Intelligence can write on this device when you’re offline or have no key. Saving a key sends a short test prompt to Gemini and stores the key in this device’s Keychain.")
+                    Text("With a key, infetit radio sends songwriting requests to Gemini. Apple Intelligence can write on this device when you’re offline or have no key. Saving a key sends a short test prompt to Gemini and stores the key in this device’s Keychain.")
                 }
             }
             .navigationTitle("Songwriting")
