@@ -13,7 +13,7 @@ Vibe Player is an experimental native app for exploring what a music player feel
 </p>
 <p align="center"><em>Pick a station. Shape the sound. Hear what comes next.</em></p>
 
-> **Early prototype:** Build it in Xcode and bring your own model assets. Music generation requires separately downloaded YuE2 weights; it is not ready to generate songs immediately after cloning.
+> **Early prototype:** Use [Quick install](#quick-install) to build Vibe Player and download the models for local music generation.
 
 ## What you can do
 
@@ -40,6 +40,27 @@ These screenshots show an earlier prototype using sample audio. The current gene
 - Xcode with a recent Swift toolchain; the packages use Swift 6.2 or later.
 - iOS or iPadOS 18+, or macOS 15+.
 - For music generation, compatible YuE2 model assets prepared for the target device. The model weights and compiled assets are **not** included in this repository.
+
+### Quick install
+
+From a clone of this repository on an Apple silicon Mac with Xcode installed:
+
+```sh
+python3 Scripts/install_models.py --build-app
+```
+
+This installs Vibe Player in `~/Applications` and downloads the Mac music and songwriting models. Use `python3 Scripts/install_models.py` to install the models for an existing build. Add `--all` for the optional full-precision and reference-audio weights.
+
+For iPhone or iPad, run the project once from Xcode using your signing team. Close the app on the device, and run this from the Mac:
+
+```sh
+xcrun devicectl list devices
+python3 Scripts/install_models.py --device YOUR_DEVICE_ID
+```
+
+Pass `--bundle-id YOUR_BUNDLE_ID` if you changed the bundle identifier for signing. Reopen the app after the models finish copying. The command installs the platform-appropriate models. See the runtime instructions below to enable the optional native Metal renderer.
+
+The installer verifies SHA-256 hashes and downloads from pinned Hugging Face revisions. The [Vibe Player Core ML repository](https://huggingface.co/ferdinandl007/vibeplayer-yue2-coreml) supplies the compiled bundles. The original publishers supply the GGUF and LFM3 weights. The music and reference weights are under CC BY-NC 4.0, and LFM3 uses the [LFM Open License](https://huggingface.co/LiquidAI/LFM3-1.7B-MLX-4bit).
 
 ### Build the app
 
